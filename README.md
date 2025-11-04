@@ -121,7 +121,8 @@ python test_api.py
 ```
 Which is set to run on AML.csv by default. To change that, scroll to the bottom of the test_api.py file and locate
 ```
-DATASET_PATH = r"/home/ubuntu/apps/MakeSurvivalCalibratedAgain/data/AML.csv"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATASET_PATH = os.path.join(BASE_DIR, "data", "AML.csv")
 ```
 Then switch out AML.csv for Breast_Cancer.csv or your own dataset file.
 
