@@ -105,7 +105,7 @@ def test_training(
             data['selected_features'] = json.dumps(features)
             print(f"   Using features: {', '.join(features)}")
         else:
-            data['selected_features'] = json.dumps(None)
+            data['selected_features'] = json.dumps('all')
             print(f"   Using all features in dataset")
         
         print(f"\n⏳ Uploading and training... (this may take a while)")
@@ -158,6 +158,61 @@ def test_training(
         except:
             print(f"   Response: {response.text[:200]}")
         return None
+
+def test_retrain(
+    model_id: str,
+    selected_features=None,
+    parameters: dict = None,
+    api_url: str = 'http://localhost:5000'
+) -> Optional[str]:
+    """Test retraining an existing model"""
+
+    print(f"\n♻️ Retraining model: {model_id}")
+    print(f"   Selected features: {selected_features}")
+    print(f"   Parameter overrides: {parameters}")
+
+    payload = {
+        "model_id": model_id,
+    }
+
+    if selected_features is not None:
+        payload["selected_features"] = selected_features
+
+    if parameters:
+        payload["parameters"] = parameters
+
+    try:
+        response = requests.post(
+            f"{api_url}/retrain",
+            json=payload,
+            timeout=600  # allow for long training
+        )
+    except Exception as e:
+        print(f"✗ Retrain request failed: {e}")
+        return None
+
+    if response.status_code == 200:
+        result = response.json()
+        print("\n✓ Retraining successful!")
+        print(f"New Model ID: {result.get('model_id')}")
+        print(f"Parent Model ID: {result.get('retrained_from')}")
+
+        print("\n📊 Performance Metrics:")
+        metrics = result.get('metrics', {})
+        for metric, val in metrics.items():
+            print(f"  {metric}: {val}")
+
+        print("\n🔁 Retrain Change Summary:")
+        summary = result.get("retrain_summary", {})
+        print(json.dumps(summary, indent=2))
+
+        return result.get("model_id")
+
+    else:
+        print(f"✗ Retraining failed (HTTP {response.status_code})")
+        print(response.text)
+        return None
+
 
 
 def test_list_models(api_url: str = 'http://localhost:5000') -> None:
@@ -290,6 +345,21 @@ Examples:
             # Create sample features dict (all zeros as placeholder)
             sample_features = {feat: 0.0 for feat in features}
             test_predict(model_id, sample_features, args.api_url)
+    
+        # Test retraining after training a model
+        print("\n🔄 Testing retraining...")
+        retrained_model_id = test_retrain(
+            model_id=model_id,
+            selected_features=features,  # reuse CLI feature selection
+            parameters={"dropout": args.dropout + 0.05},  # example change
+            api_url=args.api_url
+        )
+
+        if retrained_model_id:
+            print(f"\n✅ Retrained successfully: {retrained_model_id}")
+        else:
+            print("\n⚠ Retraining failed")
+
     
     # Print footer
     print("\n" + "=" * 60)

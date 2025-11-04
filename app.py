@@ -52,6 +52,7 @@ dcal_chisquare = []
 dcal_p_value_stat = []
 train_times = []
 infer_times = []
+dcal_hists = []
 n_features = 0
 
 class Args:
@@ -257,7 +258,7 @@ def train_mtlr_model(dataset_path, selected_features, args, i):
 
     # ADD THIS AT THE START OF THE FUNCTION
     global ci, mae_hinge, mae_po, ibs, km_cal, xcal_stats, wsc_xcal_stats
-    global dcal_chisquare, dcal_p_value_stat, train_times, infer_times, n_features
+    global dcal_chisquare, dcal_p_value_stat, train_times, infer_times, dcal_hists, n_features
 
     # ✅ START TIMING
     # t0 = time.time()
@@ -495,6 +496,7 @@ def train_mtlr_model(dataset_path, selected_features, args, i):
     dcal_chisquare.append(float(dcal_chisquare_stat))
     dcal_p_value_stat.append(float(dcal_p_value))
     wsc_xcal_stats.append(wsc_xcal_score)
+    dcal_hists.append(torch.tensor(dcal_hist))
     train_times.append(train_time)
     infer_times.append(infer_time)
 
@@ -545,31 +547,29 @@ def serve_model_file(model_id, filename):
 @app.route('/train', methods=['POST'])
 def train_model():
     """
-    Train MTLR model with ALL features in the dataset
+    Train MTLR model with feature selection
     
     Expected CSV format:
     - First column: Time/Label (survival time or duration)
     - Second column: Censored (0=event occurred/uncensored, 1=censored)
     - Remaining columns: Features for prediction
     
-    Expected form data:
-    - dataset: CSV file with survival data in the format above
-    - parameters: JSON object with model parameters (optional)
-    
-    This endpoint ALWAYS uses ALL features in the dataset (except first two columns).
-    Use /retrain endpoint if you want to select specific features.
+    Feature Selection Logic:
+    - selected_features='all' → Use ALL features from dataset
+    - selected_features=['feat1', 'feat2'] → Use ONLY these specific features
+    - selected_features=None (or not provided) → No features selected (will use all by default)
     
     Example JSON request:
     {
         "dataset_path": "/path/to/data.csv",
+        "selected_features": "all",  // or ["Height", "Weight"] or null
         "parameters": {"neurons": [64, 64], "dropout": 0.1}
     }
     """
-    # --- Before training experiments in /train ---
+    # Reset metrics before training
     global ci, mae_hinge, mae_po, ibs, km_cal, xcal_stats, wsc_xcal_stats
-    global dcal_chisquare, dcal_p_value_stat, train_times, infer_times, n_features
+    global dcal_chisquare, dcal_p_value_stat, train_times, infer_times, dcal_hists, n_features
 
-    # Reset metrics
     ci.clear()
     mae_hinge.clear()
     mae_po.clear()
@@ -581,6 +581,7 @@ def train_model():
     dcal_p_value_stat.clear()
     train_times.clear()
     infer_times.clear()
+    dcal_hists.clear()
     n_features = 0
 
     try:
@@ -617,16 +618,30 @@ def train_model():
         parameters = request.json.get('parameters', {}) if request.is_json else \
                      json.loads(request.form.get('parameters', '{}'))
         
-        # Parse selected features
-        selected_features = request.json.get('selected_features', None) if request.is_json else \
-                            json.loads(request.form.get('selected_features', None))
+        # Parse selected features with new logic
+        selected_features_input = request.json.get('selected_features', None) if request.is_json else \
+                                   json.loads(request.form.get('selected_features', 'null'))
 
-        config = {'selected_features': selected_features } 
+        # Feature Selection Logic
+        if selected_features_input == 'all':
+            # All features selected
+            selected_features = 'all'
+            selected_features_for_training = None  # None means use all in prepare_data
+        elif isinstance(selected_features_input, list) and len(selected_features_input) > 0:
+            # Specific features selected
+            selected_features = selected_features_input
+            selected_features_for_training = selected_features_input
+        else:
+            # No features selected (None or empty) - default to all
+            selected_features = None
+            selected_features_for_training = None
+
+        config = {'selected_features': selected_features_for_training} 
         
         # Merge parameters into config
         config.update(parameters)
 
-        # Pass configurations + features into Args (has config and other default hyperparameters)
+        # Pass configurations + features into Args
         args = Args(config)
 
         # safety: ensure n_exp is an int >= 1
@@ -648,7 +663,7 @@ def train_model():
         train_start = time.time()
         for i in trange(n_exp, disable=not args.verbose, desc='Experiment'):
             icp, encoder = train_mtlr_model(
-                dataset_path, selected_features, args, i
+                dataset_path, selected_features_for_training, args, i
             )
 
         train_end = time.time()
@@ -656,14 +671,14 @@ def train_model():
         train_duration = train_end - train_start
 
         # ----------------------------
-        # 4️⃣ Save artifacts
+        # Save artifacts
         # ----------------------------
 
         # Save model weights (state_dict)
         model_path = os.path.join(model_dir, "model_weights.pth")
         torch.save({"model_state_dict": icp.nc_function.model.state_dict()}, model_path)
         
-        # Save model config
+        # Save model config (only model architecture params, NOT selected_features)
         model_config = {
             "model_type": "MTLR",
             "n_features": icp.nc_function.model.in_features,
@@ -676,11 +691,18 @@ def train_model():
         config_path = os.path.join(model_dir, "model_config.json")
         with open(config_path, 'w') as f:
             json.dump(model_config, f, indent=2)
+        
+        # Save training metadata separately (includes selected_features)
+        training_metadata = {
+            "selected_features": selected_features,  # Store as 'all', list, or None
+            "dataset_path": dataset_path,
+            "n_experiments": n_exp,
+            "timestamp": model_timestamp_date
+        }
+        metadata_path = os.path.join(model_dir, "training_metadata.json")
+        with open(metadata_path, 'w') as f:
+            json.dump(training_metadata, f, indent=2)
 
-        # Save trained at timestamp date
-        trained_date_path = os.path.join(model_dir, "trained_at.txt")
-        with open(trained_date_path, 'w') as f:
-            f.write(model_timestamp_date)
 
         # Save encoder pipeline
         encoder_path = os.path.join(model_dir, "encoder.joblib")
@@ -707,8 +729,9 @@ def train_model():
         )
 
         metrics['n_features'] = n_features
+        metrics['d_cal_hist'] = torch.stack(dcal_hists).mean(0).tolist()
 
-        # After saving artifacts, make base_url
+        # Make base_url
         base_url = request.host_url.rstrip("/")  # e.g., http://localhost:5000
        
 
@@ -716,11 +739,12 @@ def train_model():
             "status": "success",
             "model_id": model_id,
             "metrics": metrics,
+            "selected_features": selected_features,  # Return as 'all', list, or None
             "model_weights": f"{base_url}/models/{model_id}/model_weights.pth",
             "encoder": f"{base_url}/models/{model_id}/encoder.joblib",
             "icp_state": f"{base_url}/models/{model_id}/icp_state.dill",
             "model_config": f"{base_url}/models/{model_id}/model_config.json",
-            "trained_at":f"{base_url}/models/{model_id}/trained_at.txt",
+            "trained_at": model_timestamp_date,
             "train_duration": train_duration,
             "timestamp": datetime.now().isoformat()
         }), 200
@@ -734,128 +758,269 @@ def train_model():
         }), 500
 
 
+# Restrict this endpoint with user permissions
 @app.route('/retrain', methods=['POST'])
 def retrain_model():
     """
-    Re-train MTLR model with SELECTED features
+    Retrain an existing model with different feature selections and/or parameters
     
-    Expected CSV format:
-    - First column: Time/Label (survival time or duration)
-    - Second column: Censored (0=event occurred/uncensored, 1=censored)
-    - Remaining columns: Features for prediction
-    
-    Expected form data:
-    - dataset: CSV file with survival data in the format above
-    - features: JSON array of selected feature names (REQUIRED)
-    - parameters: JSON object with model parameters
-    
-    This endpoint allows you to select specific features for training.
-    Use /train endpoint if you want to use ALL features.
-    
-    Example JSON request:
+    Expected JSON request:
     {
-        "dataset_path": "/path/to/data.csv",
-        "features": ["Height", "Weight", "Eye_Color"],
-        "parameters": {"neurons": [64, 64], "dropout": 0.1}
+        "model_id": "mtlr_20231103_120000_abc123",  # REQUIRED - existing model to retrain
+        "dataset_path": "/path/to/data.csv",        # Can use same or different dataset
+        "selected_features": "all",                  # OPTIONAL - see feature selection logic below
+        "parameters": {"neurons": [64, 64], "dropout": 0.1}  # Optional parameter overrides
     }
+    
+    Feature Selection Logic:
+    - selected_features='all' → Use ALL features from dataset
+    - selected_features=['feat1', 'feat2'] → Use ONLY these specific features
+    - selected_features=None (or not provided) → INHERIT from parent model
+    
+    Three retraining scenarios:
+    1. All features + different parameters: set selected_features='all', provide parameters
+    2. Selected features + same parameters: provide selected_features list, omit parameters
+    3. Selected features + different parameters: provide both
     """
+    # Reset metrics before training
+    global ci, mae_hinge, mae_po, ibs, km_cal, xcal_stats, wsc_xcal_stats
+    global dcal_chisquare, dcal_p_value_stat, train_times, infer_times, dcal_hists, n_features
+
+    ci.clear()
+    mae_hinge.clear()
+    mae_po.clear()
+    ibs.clear()
+    km_cal.clear()
+    xcal_stats.clear()
+    wsc_xcal_stats.clear()
+    dcal_chisquare.clear()
+    dcal_p_value_stat.clear()
+    train_times.clear()
+    infer_times.clear()
+    dcal_hists.clear()
+    n_features = 0
+
     try:
-        # Handle dataset - either as file upload or JSON path
-        dataset_path = None
+        # Get request data
+        if not request.is_json:
+            return jsonify({'error': 'Content-Type must be application/json'}), 400
         
-        # Option 1: File upload (multipart/form-data)
-        if 'dataset' in request.files:
-            file = request.files['dataset']
-            if file.filename == '':
-                return jsonify({'error': 'No dataset file selected'}), 400
-            
-            if not file.filename.endswith('.csv'):
-                return jsonify({'error': 'Dataset file must be a CSV'}), 400
-            
-            # Save uploaded file
-            filename = secure_filename(file.filename)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            dataset_filename = f"{timestamp}_{filename}"
-            dataset_path = os.path.join(app.config['UPLOAD_FOLDER'], dataset_filename)
-            file.save(dataset_path)
+        json_data = request.json
         
-        # Option 2: JSON request with dataset path
-        elif request.is_json:
-            json_data = request.json
-            dataset_path = json_data.get('dataset_path')
-            if not dataset_path or not os.path.exists(dataset_path):
-                return jsonify({'error': 'Invalid or missing dataset_path'}), 400
+        # REQUIRED: model_id of existing model
+        model_id = json_data.get('model_id')
+        if not model_id:
+            return jsonify({'error': 'model_id is required for retraining'}), 400
         
+        # Check if model exists
+        original_model_dir = os.path.join(app.config['MODEL_FOLDER'], model_id)
+        if not os.path.exists(original_model_dir):
+            return jsonify({'error': f'Model {model_id} not found'}), 404
+        
+        # Load original model config and metadata
+        original_config_path = os.path.join(original_model_dir, 'model_config.json')
+        original_metadata_path = os.path.join(original_model_dir, 'training_metadata.json')
+        
+        with open(original_config_path, 'r') as f:
+            original_config = json.load(f)
+        
+        # Load metadata if exists, otherwise use defaults
+        if os.path.exists(original_metadata_path):
+            with open(original_metadata_path, 'r') as f:
+                original_metadata = json.load(f)
         else:
-            return jsonify({'error': 'No dataset provided (either upload file or provide dataset_path)'}), 400
-        
-        
-        # Parse configuration based on request type
-        if request.is_json:
-            # JSON request format
-            json_data = request.json
-            features = json_data.get('features', [])
-            parameters = json_data.get('parameters', {})
-            
-            config = {
-                'selected_features': features,
-            }
-        else:
-            # Form data request format
-            features = json.loads(request.form.get('features', '[]'))
-            parameters = json.loads(request.form.get('parameters', '{}'))
-            
-            config = {
-                'selected_features': features,
+            # Fallback for older models that might have selected_features in config
+            original_metadata = {
+                'selected_features': original_config.get('selected_features', None)
             }
         
-        # Merge parameters into config
-        config.update(parameters)
+        # Dataset Override Logic
+        dataset_path_input = json_data.get("dataset_path")
+        if dataset_path_input:
+            dataset_path = dataset_path_input
+        else:
+            # Just pull the dataset from the original model's training metadata)
+            dataset_path = original_metadata.get("dataset_path")
+
+        if not dataset_path:
+            return jsonify({"error": "dataset_path missing and not found in parent model metadata"}), 400
+       
+        # Feature Selection Logic
+        selected_features_input = json_data.get('selected_features', 'inherit')
         
-        # Extract selected features
-        selected_features = config.get('selected_features', None)
+        if selected_features_input == 'inherit':
+            # Not provided - inherit from parent
+            selected_features = original_metadata.get('selected_features')
+            selected_features_for_training = None if selected_features == 'all' else selected_features
+            features_source = 'inherited'
+        elif selected_features_input == 'all':
+            # Explicitly use all features
+            selected_features = 'all'
+            selected_features_for_training = None
+            features_source = 'all'
+        elif isinstance(selected_features_input, list):
+            # Specific feature list
+            if len(selected_features_input) == 0:
+                return jsonify({'error': 'selected_features list cannot be empty'}), 400
+            selected_features = selected_features_input
+            selected_features_for_training = selected_features_input
+            features_source = 'selected'
+        elif selected_features_input is None:
+            # Explicitly set to None - inherit from parent
+            selected_features = original_metadata.get('selected_features')
+            selected_features_for_training = None if selected_features == 'all' else selected_features
+            features_source = 'inherited'
+        else:
+            return jsonify({
+                'error': 'selected_features must be "all", a list of features, null, or omitted to inherit'
+            }), 400
         
-        # Train model
-        icp, encoder, metrics, args = train_mtlr_model(
-            dataset_path, selected_features, config
-        )
+        # Get optional parameter overrides
+        parameters = json_data.get('parameters', {})
         
-        # Generate model ID
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_id = f"mtlr_{timestamp}"
-        
-        # Save model
-        model_path = os.path.join(app.config['MODEL_FOLDER'], f'{model_id}.pkl')
-        model_data = {
-            'icp': icp,
-            'encoder': encoder,
-            'config': config,
-            'args': vars(args),
-            'timestamp': datetime.now().isoformat(),
-            'model_type': 'MTLR',
-            'selected_features': selected_features
+        # Start with original config, then override with new parameters
+        config = {
+            'selected_features': selected_features_for_training,
+            'neurons': parameters.get('neurons', original_config.get('neurons')),
+            'dropout': parameters.get('dropout', original_config.get('dropout')),
+            'activation': parameters.get('activation', original_config.get('activation')),
+            'norm': parameters.get('norm', original_config.get('norm')),
         }
         
-        with open(model_path, 'wb') as f:
-            pickle.dump(model_data, f)
+        # Override with any other user-provided parameters
+        for key, value in parameters.items():
+            if key not in config:
+                config[key] = value
+
+        args = Args(config)
+        n_exp = max(1, int(getattr(args, 'n_exp', 1)))
+
+        # Create NEW model ID for the retrained version
+        now = datetime.now()
+        model_timestamp = now.strftime("%Y%m%d_%H%M%S")
+        model_timestamp_date = now.date().isoformat()
+        suffix = uuid.uuid4().hex[:6]
+        new_model_id = f"mtlr_retrain_{model_timestamp}_{suffix}"
+
+        model_dir = os.path.join(app.config['MODEL_FOLDER'], new_model_id)
+        os.makedirs(model_dir, exist_ok=True)
+
+        # Training Loop 
+        train_start = time.time()
+        for i in trange(n_exp, disable=not args.verbose, desc='Experiment'):
+            icp, encoder = train_mtlr_model(
+                dataset_path, selected_features_for_training, args, i
+            )
+
+        train_end = time.time()
+        train_duration = train_end - train_start
+
+        # ----------------------------
+        # Save artifacts
+        # ----------------------------
+
+        # Save model weights (state_dict)
+        model_path = os.path.join(model_dir, "model_weights.pth")
+        torch.save({"model_state_dict": icp.nc_function.model.state_dict()}, model_path)
+
+        # Track what changed in this retrain
+        retrain_history = {
+            "original_features": original_metadata.get('selected_features'),
+            "new_features": selected_features,
+            "features_source": features_source,
+            "features_changed": original_metadata.get('selected_features') != selected_features,
+            "parameter_changes": {}
+        }
         
-        # Return response
+        # Track which parameters changed
+        for param in ['neurons', 'dropout', 'activation', 'norm']:
+            if param in parameters and parameters[param] != original_config.get(param):
+                retrain_history['parameter_changes'][param] = {
+                    'old': original_config.get(param),
+                    'new': parameters[param]
+                }
+        
+        # Save model config (only model architecture params)
+        model_config = {
+            "model_type": "MTLR",
+            "n_features": icp.nc_function.model.in_features,
+            "time_bins": icp.nc_function.model.time_bins.tolist(),
+            "neurons": args.neurons,
+            "dropout": args.dropout,
+            "activation": args.activation,
+            "norm": args.norm,
+        }
+        config_path = os.path.join(model_dir, "model_config.json")
+        with open(config_path, 'w') as f:
+            json.dump(model_config, f, indent=2)
+        
+        # Save training metadata separately (includes selected_features and retrain history)
+        training_metadata = {
+            "selected_features": selected_features,
+            "parent_model_id": model_id,
+            "retrain_history": retrain_history,
+            "dataset_path": dataset_path,
+            "n_experiments": n_exp,
+            "timestamp": model_timestamp_date
+        }
+        metadata_path = os.path.join(model_dir, "training_metadata.json")
+        with open(metadata_path, 'w') as f:
+            json.dump(training_metadata, f, indent=2)
+
+
+        encoder_path = os.path.join(model_dir, "encoder.joblib")
+        joblib.dump(encoder, encoder_path)
+
+        icp_state_path = os.path.join(model_dir, "icp_state.dill")
+        with open(icp_state_path, "wb") as f:
+            dill.dump(icp, f)
+
+        metrics = print_performance(
+            Cindex=ci,
+            IBS=ibs,
+            MAE_Hinge=mae_hinge,
+            MAE_PO=mae_po,
+            KM_cal=km_cal,
+            xCal_stats=xcal_stats,
+            wsc_xCal_stats=wsc_xcal_stats,
+            dcal_p=dcal_p_value_stat,
+            dcal_Chi=dcal_chisquare,
+            train_times=train_times,
+            infer_times=infer_times
+        )
+
+        metrics['n_features'] = n_features
+        metrics['d_cal_hist'] = torch.stack(dcal_hists).mean(0).tolist()
+
+        base_url = request.host_url.rstrip("/")
+
         return jsonify({
-            'status': 'success',
-            'model_id': model_id,
-            'model_path': os.path.abspath(model_path),
-            'metrics': metrics,
-            'config': config,
-            'timestamp': datetime.now().isoformat()
+            "status": "success",
+            "model_id": new_model_id,
+            "parent_model_id": model_id,
+            "metrics": metrics,
+            "selected_features": selected_features,  # Return as 'all', list, or None
+            "model_weights": f"{base_url}/models/{new_model_id}/model_weights.pth",
+            "encoder": f"{base_url}/models/{new_model_id}/encoder.joblib",
+            "icp_state": f"{base_url}/models/{new_model_id}/icp_state.dill",
+            "model_config": f"{base_url}/models/{new_model_id}/model_config.json",
+            "trained_at": model_timestamp_date,
+            "train_duration": train_duration,
+            "retrained_from": model_id,
+            "retrain_summary": {
+                "features_changed": retrain_history['features_changed'],
+                "parameters_changed": list(retrain_history['parameter_changes'].keys()),
+                "features_source": features_source
+            },
+            "timestamp": datetime.now().isoformat()
         }), 200
-    
+
     except Exception as e:
         return jsonify({
             'status': 'error',
             'error': str(e),
             'error_type': type(e).__name__
         }), 500
-
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -1005,7 +1170,7 @@ def list_models():
 
             # Check for key artifacts
             artifacts = {}
-            for artifact_name in ['model_weights.pth', 'encoder.joblib', 'icp_state.dill', 'model_config.json', 'trained_at.txt']:
+            for artifact_name in ['model_weights.pth', 'encoder.joblib', 'icp_state.dill', 'model_config.json', 'training_metadata.json']:
                 artifact_path = os.path.join(model_folder, artifact_name)
                 if os.path.exists(artifact_path):
                     artifacts[artifact_name] = f"{base_url}/models/{model_id}/{artifact_name}"
@@ -1019,7 +1184,13 @@ def list_models():
                 with open(config_path, 'r') as f:
                     config_data = json.load(f)
                     model_type = config_data.get('model_type', 'MTLR')
-                    timestamp = config_data.get('timestamp')
+
+            training_metadata_path = os.path.join(model_folder, 'training_metadata.json');
+            if os.path.exists(training_metadata_path):
+                import json
+                with open(training_metadata_path, 'r') as f:
+                    training_metadata = json.load(f)
+                    timestamp = training_metadata['timestamp']
 
             models.append({
                 'model_id': model_id,
