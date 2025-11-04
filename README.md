@@ -1,30 +1,17 @@
-# Make Survival Calibrated Again
+# Make Survival Calibrated Again MTLR API with Inductive Conformal Prediction
 
----
-
-This official repository contains the code for
-1. Conformalized Survival Distributions (**CSD**). See [1].
-2. Conformalized Survival Distributions using Individual survival Probability at Observed Time (**CiPOT**). See [2].
-
-It also contains the implementations of the worst-slab distribution calibration score, $\text{Cal}_{\text{ws}}$. See [2]. 
 
 ## Introduction
 
-**TL;DR** This repository contains two methods that enhance the calibration of a survival analysis model, without compromising its discriminative ability.
+This derived repository contains the code for The API for the MTLR model **with** inductive conformal prediction
 
-|                                                                                                                ![compare](methods_illust.png)                                                                                                                | 
-|:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------:| 
-| **Visual illustration of using *CSD* and *CiPOT* to make the prediction calibrated.** (a-c) Raw survival distribution outputs with histogram and P-P plot; (d-g) CSD steps with histogram and P-P plot; (h-k) CiPOT steps with histogram and P-P plot. |
-
-Both **CSD** and **CiPOT** approaches use the same general framework of conformal prediction, but they differ in
-how to calculate the conformity score and adjust the positions of the predictions. Note that in the above Figure,
-the horizontal positions of the circles remain unchanged for **CSD** while the vertical positions of the
-circles remain unchanged for **CiPOT**.
-About details of the algorithms (e.g., how to calculate the conformity score, how to handle censorship, etc.), please refer to the paper.
 
 ## Overview
 
-This repository contains the code for the experiments in the papers. The code is organized as follows:
+This repo **firstly** contains the MTLR API
+
+
+This repository also contains the code for the experiments in the papers from the original repo. The code is organized as follows:
 - `args/`: The arguments for the experiments.
 - `CondCalEvaluation/`: The implementation of the conditional calibration score, $\text{Cal}_{\text{ws}}$.
 - `data/`: The datasets used in the experiments.
@@ -39,6 +26,7 @@ This repository contains the code for the experiments in the papers. The code is
 - `run_baselines.py`: The script to run the non post-processed baselines.
 - `run_sh`: The script to run the experiments in one go.
 
+However, you can ignore a majority of everything above because this repo is primarily for using the MTLR-focused API
 
 
 ## Getting Started
@@ -46,10 +34,20 @@ This repository contains the code for the experiments in the papers. The code is
 
 ### Prerequisites
 
-Clone the repo, create a virtual environment with Python version 3.11.7
+Clone the repo, create a virtual environment with Python version >= 3.10.12 
 
 ```
-conda create -n MakeSurvivalCalibratedAgain python=3.11.7
+python -m venv venv
+```
+#### Activate it:  
+
+Windows (PowerShell):
+```
+.\venv\Scripts\Activate.ps1
+```
+macOS/Linux:
+```
+source venv/bin/activate
 ```
 Then install the requirements.txt file
 ```
@@ -57,33 +55,38 @@ pip install -r requirements.txt
 ```
 
 
-### Running the Experiments
+### Using the API
 
-Using the provided codes, reader can run the experiments on a few datasets: `VALCT`, `HFCR`, `PBC`, `WHAS500`,  `GBSG`, `PdM`, `churn`, `NACD`, `FLCHAIN`, `SUPPORT`, `employee`. 
-
-To run the experiments using `CSD` with default parameters, you can use the following script:
+To run the server:
 ```bash
-python3 run.py --data [choice_of_data] --model [choice_of_baseline] --post_process CSD
+python app.py
 ```
+Normally, the server is set to run on
+http://localhost:5000
 
-To run the experiments using `CiPOT` with default parameters, you can use the following script:
-```bash
-python3 run.py --data [choice_of_data] --model [choice_of_baseline] --post_process CSD-iPOT
+#### Configure
+At the bottom of app.py, you can freely modify the port. Just be sure to reference that same port when accessing the URL of this API.
+
+### Testing the API
+
+I have included two default starting csv datasets that are formatted according to PSSP dataset requirements:
+1. AML.csv
+2. Breast_Cancer.csv
+
+Utilizing any other dataset will not work unless you import your own correctly formatted dataset into /data and use that instead.
+
+Please refer to the following link on dataset file format:
+http://pssp.srv.ualberta.ca/home/file_format
+
+To test the /train endpoint of the API:
 ```
-
-To compare the `CSD` or `CiPOT` with the raw baselines, you can use the following script:
-```bash
-python3 run_baselines.py --data [choice_of_data] --model [choice_of_baseline]
+python test_api.py
 ```
-
-For example, to compare `CSD`, and`CiPOT` on the `SUPPORT` dataset using the `AFT` model, you can use the following script:
-```bash
-python3 run.py --data SUPPORT --model AFT --post_process CSD
-python3 run.py --data SUPPORT --model AFT --post_process CSD-iPOT
-python3 run_baselines.py --data SUPPORT --model AFT
+Which is set to run on AML.csv by default. To change that, scroll to the bottom of the test_api.py file and locate
 ```
-
-For more details on the argument options, please refer to the `args/__init__.py` file.
+DATASET_PATH = r"/home/ubuntu/apps/MakeSurvivalCalibratedAgain/data/AML.csv"
+```
+Then switch out AML.csv for Breast_Cancer.csv or your own dataset file.
 
 ## Reference
 [1] Shi-ang Qi, Yakun Yu, Russell Greiner. Conformalized Survival Distributions: A Generic Post-Process to Increase Calibration. ICML 2024. [[paper](https://proceedings.mlr.press/v235/qi24a.html)]
