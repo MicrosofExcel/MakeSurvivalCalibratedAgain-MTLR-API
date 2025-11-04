@@ -8,7 +8,7 @@ This derived repository contains the code for The API for the MTLR model **with*
 
 ## Overview
 
-This repo **firstly** contains the MTLR API
+This repo **firstly** contains the MTLR API. This API currently only has a working /train endpoint and /models endpoint which trains and retrieves models. The rest will be implemented later.
 
 
 This repository also contains the code for the experiments in the papers from the original repo. The code is organized as follows:
