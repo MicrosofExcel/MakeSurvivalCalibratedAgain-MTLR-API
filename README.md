@@ -8,7 +8,7 @@ This derived repository contains the code for The API for the MTLR model **with*
 
 ## Overview
 
-This repo **firstly** contains the MTLR API
+This repo **firstly** contains the MTLR API. This API currently only has a working /train endpoint and /models endpoint which trains and retrieves models. The rest will be implemented later.
 
 
 This repository also contains the code for the experiments in the papers from the original repo. The code is organized as follows:
@@ -66,6 +66,43 @@ http://localhost:5000
 
 #### Configure
 At the bottom of app.py, you can freely modify the port. Just be sure to reference that same port when accessing the URL of this API.
+
+### API input
+
+The API expects input in this form:
+```
+response = requests.post(
+                f'{api_url}/train',
+                files=files,
+                data=data,
+                timeout=600  # 10 minute timeout for training
+            )
+```
+where files is
+```
+ with open(dataset_path, 'rb') as f:
+        files = {
+            'dataset': (os.path.basename(dataset_path), f, 'text/csv')
+        }
+```
+and data is
+```
+data = {
+        'parameters': 
+                'neurons': [64,64],
+                'dropout': 0.1,
+                'seed': 0,
+                'n_quantiles': 10,
+                'lr': 1e-3,
+                'batch_size': 256,
+                'n_epochs': 500,
+                'weight_decay': 1e-4 ,
+                'n_exp': 10,
+                 ....
+
+}
+```
+The timeout will be based off celery for task processing which we will discuss later.
 
 ### Testing the API
 
