@@ -482,7 +482,7 @@ def train_mtlr_model(dataset_path, selected_features, args, i):
     else:
         wsc_xcal_score = 0  # not enough data to compute the WSC
 
-    t18 = time.time()
+    # t18 = time.time()
     # print(f"[Exp {i+1}] Calculate metrics: {t18-t17:.3f}s")
     # print(f"[Exp {i+1}] === TOTAL TIME: {t18-t0:.3f}s ===\n")
 

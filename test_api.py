@@ -94,7 +94,7 @@ def test_training(
                 'lr': 1e-3,
                 'batch_size': 256,
                 'n_epochs': 500,
-                'weight_decay': 1e-4 ,
+                'weight_decay': 1e-4 , 
                 'n_exp': 10
 
             }),
@@ -266,7 +266,10 @@ Examples:
     if not test_health(args.api_url):
         sys.exit(1)
     
-    DATASET_PATH = r"/home/ubuntu/apps/MakeSurvivalCalibratedAgain/data/AML.csv"
+    # RELATIVE PATH ACCORDING TO USER
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    DATASET_PATH = os.path.join(BASE_DIR, "data", "AML.csv")
+
     
     # Test training
     model_id = test_training(
