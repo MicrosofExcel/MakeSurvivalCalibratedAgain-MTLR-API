@@ -422,8 +422,8 @@ def train_mtlr_model(dataset_path, selected_features, args, i):
     icp.fit(data_train_for_fit, data_val_for_fit)
     
     
-    t14 = time.time()
-    print(f"[Exp {i+1}] icp.fit(): {t14-t13:.3f}s")
+    # t14 = time.time()
+    # print(f"[Exp {i+1}] icp.fit(): {t14-t13:.3f}s")
 
     # Calibrate
     if args.use_train and X_val is not None:
