@@ -53,8 +53,8 @@ def test_training(
     features: Optional[List[str]] = None,
     api_url: str = 'http://localhost:5000',
     neurons: List[int] = [64, 64],
-    dropout: float = 0.1,
-    seed: int = 42
+    dropout: float = 0.2,
+    seed: int = 42,
 ) -> Optional[str]:
     """
     Test model training by uploading a dataset file
@@ -84,21 +84,24 @@ def test_training(
         files = {
             'dataset': (os.path.basename(dataset_path), f, 'text/csv')
         }
-        
+
         data = {
             'parameters': json.dumps({
                 'neurons': neurons,
                 'dropout': dropout,
                 'seed': seed,
-                'n_quantiles': 10,
+                'n_quantiles': 9,
                 'lr': 1e-3,
                 'batch_size': 256,
-                'n_epochs': 500,
-                'weight_decay': 1e-4 , 
-                'n_exp': 10
-
+                'n_epochs': 1000,
+                'weight_decay': 1e-4,
+                'n_exp': 10,
+                
             }),
+            'return_cv_predictions': 'true'
         }
+
+
         
         # Add features if provided
         if features:
@@ -132,8 +135,8 @@ def test_training(
             print("\n✓ Training successful!")
             print(f"\n{'='*60}")
             print(f"Model ID: {result['model_id']}")
-            print(f"Model Weights: {result['model_weights']}")
-            print(f"Model Config: {result['model_config']}")
+            print(f"Model Config: {result['model_config']}") 
+            print(f"CV Predictions: {result['cv_predictions']}")
             print(f"Train Duration: {result['train_duration']:.3f}")
 
             print(f"{'='*60}")
@@ -163,7 +166,7 @@ def test_retrain(
     model_id: str,
     selected_features=None,
     parameters: dict = None,
-    api_url: str = 'http://localhost:5000'
+    api_url: str = 'http://localhost:5000',
 ) -> Optional[str]:
     """Test retraining an existing model"""
 
@@ -173,7 +176,9 @@ def test_retrain(
 
     payload = {
         "model_id": model_id,
+        "return_cv_predictions": True
     }
+
 
     if selected_features is not None:
         payload["selected_features"] = selected_features
@@ -333,7 +338,7 @@ Examples:
         api_url=args.api_url,
         neurons=neurons,
         dropout=args.dropout,
-        seed=args.seed
+        seed=args.seed,
     )
     
     if model_id:
@@ -352,7 +357,7 @@ Examples:
             model_id=model_id,
             selected_features=features,  # reuse CLI feature selection
             parameters={"dropout": args.dropout + 0.05},  # example change
-            api_url=args.api_url
+            api_url=args.api_url,
         )
 
         if retrained_model_id:

@@ -110,13 +110,8 @@ def prepare_data(dataset_path, selected_features=None, args=None):
     data = data.rename(columns={columns[0]: 'time', columns[1]: 'censored'})
     data['event'] = ((data['censored'] == 0) | (data['censored'] == 'u')).astype(int)
 
-    # ✅ Remove invalid zero-time rows (Time = 0 and Event = 1/occurred). Not plausible
+    # Remove invalid zero-time rows (Time = 0 and Event = 1/occurred). Not plausible
     invalid_mask = (data["time"] <= 0)
-
-    # # of invalid masks removed.
-    # if invalid_mask.any():
-    #     print(f"Removing {invalid_mask.sum()} samples with invalid time <= 0")
-
     data = data[~invalid_mask]
 
     data = data.drop(columns='censored')
@@ -132,7 +127,8 @@ def prepare_data(dataset_path, selected_features=None, args=None):
 
     # Identify columns
     numeric_cols = data.select_dtypes(include=['int64', 'float64']).columns.tolist()
-    numeric_cols = [c for c in numeric_cols if c not in ['time', 'event']]
+
+    numeric_cols = [c for c in numeric_cols if c not in ['time', 'event']] 
 
     ordinal_cols = [c for c in numeric_cols if data[c].dtype == 'int64']      # Discrete/ordinal
     continuous_cols = [c for c in numeric_cols if data[c].dtype == 'float64'] # Continuous
@@ -169,12 +165,12 @@ def prepare_data(dataset_path, selected_features=None, args=None):
             ("bin", binary_pipeline, binary_cols),
             ("nom", nominal_pipeline, nominal_cols)
         ],
+        remainder='passthrough', # <--- Appends time and event columns after transformation of the rest of the columns
         verbose_feature_names_out=False
     )
     encoder.set_output(transform='pandas')
 
     # Train / val / test split
-  
     if args.early_stop:
         pct_train = 0.8
         pct_val = 0.1
@@ -227,33 +223,10 @@ def print_performance(
     
     return metrics_dict  # Return the dictionary
 
-def make_strictly_increasing(x: np.ndarray, eps: float = 1e-10) -> np.ndarray:
-    """
-    Convert an array into a strictly increasing sequence by adding a tiny jitter
-    to duplicate or non-increasing values.
-
-    Parameters
-    ----------
-    x : np.ndarray
-        Original array (may contain duplicates or non-increasing values)
-    eps : float
-        Small increment to enforce strict increase
-
-    Returns
-    -------
-    x_new : np.ndarray
-        Strictly increasing array
-    """
-    x_new = x.copy()
-    for i in range(1, len(x_new)):
-        if x_new[i] <= x_new[i - 1]:
-            x_new[i] = x_new[i - 1] + eps
-    return x_new
 
 
 
-
-def train_mtlr_model(dataset_path, selected_features, args, i):
+def train_mtlr_model(dataset_path, selected_features, args, i, return_predictions=False):
     """Train MTLR model with conformal prediction"""
 
     # ADD THIS AT THE START OF THE FUNCTION
@@ -270,13 +243,12 @@ def train_mtlr_model(dataset_path, selected_features, args, i):
 
     # Set ALL RNG controls
     set_seed(seed, device)  # this should set torch + cuda + python.random
-    np.random.seed(seed)    # explicitly set NumPy
 
     # t1 = time.time()
     # print(f"[Exp {i+1}] Setup & seeding: {t1-t0:.3f}s")
     
     # Prepare data AFTER seeding
-    encoder, pct_train, pct_val, pct_test, data = prepare_data(
+    enc_df, pct_train, pct_val, pct_test, data = prepare_data(
         dataset_path, selected_features, args
     )
 
@@ -298,75 +270,25 @@ def train_mtlr_model(dataset_path, selected_features, args, i):
     # t3 = time.time()
     # print(f"[Exp {i+1}] Data split: {t3-t2:.3f}s")
 
+    # standardize the data
+    data_train = enc_df.fit_transform(data_train).astype('float32')
+    data_val = enc_df.transform(data_val).astype('float32') if not data_val.empty else data_val
+    data_test = enc_df.transform(data_test).astype('float32')
 
-    # Separate features and survival labels
-    X_train = data_train.drop(columns=['time', 'event'])
-    y_train = data_train[['time', 'event']]
+    # get the labels for evaluation
+    t_train, e_train = data_train["time"].values, data_train["event"].values
+    t_val, e_val = data_val["time"].values, data_val["event"].values if not data_val.empty else None
+    x_test = data_test.drop(['time', 'event'], axis=1).values
+    t_test, e_test = data_test["time"].values, data_test["event"].values
+    t_train_val = np.concatenate((t_train, t_val)) if not data_val.empty else t_train
+    e_train_val = np.concatenate((e_train, e_val)) if not data_val.empty else e_train
 
-    X_val = data_val.drop(columns=['time', 'event']) if not data_val.empty else None
-    y_val = data_val[['time', 'event']] if not data_val.empty else None
 
-    X_test = data_test.drop(columns=['time', 'event'])
-    y_test = data_test[['time', 'event']]
-
-    # t4 = time.time()
-    # print(f"[Exp {i+1}] Separate features/labels: {t4-t3:.3f}s")
-
-    # ✅ Keep DataFrame form. Fit encoder on X_train only
-    X_train = encoder.fit_transform(X_train)
-
-    # t5 = time.time()
-    # print(f"[Exp {i+1}] Encoder fit_transform: {t5-t4:.3f}s")
-
-    if X_val is not None:
-        X_val = encoder.transform(X_val)
-    X_test = encoder.transform(X_test)
-
-    # t6 = time.time()
-    # print(f"[Exp {i+1}] Encoder transform val/test: {t6-t5:.3f}s")
-
-    # ✅ REMOVE SLOW OPERATION - just use astype directly
-    # The encoder already outputs numeric data, no need for pd.to_numeric
-    X_train = X_train.astype("float32")
-
-    # t7 = time.time()
-    # print(f"[Exp {i+1}] X_train astype: {t7-t6:.3f}s")
-
-    if X_val is not None:
-        X_val = X_val.astype("float32")
-    X_test = X_test.astype("float32")
-
-    # t8 = time.time()
-    # print(f"[Exp {i+1}] X_val/X_test astype: {t8-t7:.3f}s")
-
-    # Extract survival labels
-    t_train, e_train = y_train['time'].values, y_train['event'].values
-    t_val, e_val = (y_val['time'].values, y_val['event'].values) if y_val is not None else (None, None)
-    t_test, e_test = y_test['time'].values, y_test['event'].values
-    
-    
-    n_features = X_train.shape[1]
-
-    # Ensure numeric dtype for survival labels
-    t_train = t_train.astype(float)
-    e_train = e_train.astype(int)
-    if t_val is not None:
-        t_val = t_val.astype(float)
-        e_val = e_val.astype(int)
-    t_test = t_test.astype(float)
-    e_test = e_test.astype(int)
-
-    # t9 = time.time()
-    # print(f"[Exp {i+1}] Extract/convert labels: {t9-t8:.3f}s")
-    
-    # Create time bins for MTLR
     discrete_bins = make_time_bins(t_train, event=e_train)
 
-    # t10 = time.time()
-    # print(f"[Exp {i+1}] make_time_bins: {t10-t9:.3f}s")
 
-    
-    
+    n_features = data_train.shape[1] - 2 # Exlucde time and event
+
     # Build MTLR model
     model = MTLR(
         n_features=n_features,
@@ -377,9 +299,6 @@ def train_mtlr_model(dataset_path, selected_features, args, i):
         dropout=args.dropout
     )
 
-    # t11 = time.time()
-    # print(f"[Exp {i+1}] Build MTLR model: {t11-t10:.3f}s")
-    
     # Setup conformal prediction
     if args.post_process == "CSD":
         nc_model = QuantileRegressionNC(model, args)
@@ -396,78 +315,76 @@ def train_mtlr_model(dataset_path, selected_features, args, i):
             n_percentile=args.n_quantiles
         )
     
-    # t12 = time.time()
-    # print(f"[Exp {i+1}] Setup conformal prediction: {t12-t11:.3f}s")
-    
 
-    # Add 'time' and 'event' back to X_train
-    data_train_for_fit = X_train.copy()
-    data_train_for_fit['time'] = t_train
-    data_train_for_fit['event'] = e_train
-
-    data_val_for_fit = None
-    data_val_for_cal = None
-    if X_val is not None:
-        data_val_for_fit = X_val.copy()
-        data_val_for_cal = X_val.copy()
-        data_val_for_fit['time'] = t_val
-        data_val_for_fit['event'] = e_val
-        data_val_for_cal['time'] = t_val
-        data_val_for_cal['event'] = e_val
-    
-    # t13 = time.time()
-    # print(f"[Exp {i+1}] Prepare data for fit: {t13-t12:.3f}s")
-
-    # Train model using tuple-based data
+    # Fit the ICP using the proper training set, and using valset for early stopping
     start_time = datetime.now()
-    icp.fit(data_train_for_fit, data_val_for_fit)
-    
-    
-    # t14 = time.time()
-    # print(f"[Exp {i+1}] icp.fit(): {t14-t13:.3f}s")
+    icp.fit(data_train, data_val)
 
-    # Calibrate
-    if args.use_train and X_val is not None:
-        icp.calibrate(data_train_for_fit)  # use train data
-    else:
-        icp.calibrate(data_val_for_cal)
-
+    # Calibrate the ICP using the calibration set
+    if args.use_train:
+        data_val = pd.concat([data_train, data_val], ignore_index=True)
+    icp.calibrate(data_val)
 
     mid_time = datetime.now()
+    # Produce predictions for the test set
+    quan_levels, quan_preds = icp.predict(x_test)
 
-    # t15 = time.time()
-    # print(f"[Exp {i+1}] icp.calibrate(): {t15-t14:.3f}s")
-
-
-    # Make predictions on test set
-    # Convert DataFrame to Numpy array
-    X_test_np = X_test.values if isinstance(X_test, pd.DataFrame) else X_test
-    quan_levels, quan_preds = icp.predict(X_test_np) 
     end_time = datetime.now()
 
-    # t16 = time.time()
-    # print(f"[Exp {i+1}] icp.predict(): {t16-t15:.3f}s")
+    # Produce predictions for test set
+    quan_levels, quan_preds = icp.predict(x_test)
     
-    # Calculate training and inference times
+    # NEW: Calculate additional statistics for each prediction
+    individual_predictions = None
+    if return_predictions:
+        # For each sample, calculate additional metrics
+        median_preds = []
+        mean_preds = []
+        prob_at_actual_time = []
+        
+        for j in range(len(t_test)):
+            # Median prediction (50th percentile)
+            median_idx = np.argmin(np.abs(quan_levels - 0.5))
+            median_pred = float(quan_preds[j, median_idx])
+            median_preds.append(median_pred)
+            
+            # Mean prediction (integrate over survival curve)
+            # Mean = integral of S(t) dt
+            mean_pred = np.trapezoid(1 - quan_levels, quan_preds[j])
+            mean_preds.append(float(mean_pred))
+            
+            # Probability of event at actual time
+            actual_t = t_test[j]
+            # Find CDF at actual time
+            reached = quan_preds[j] <= actual_t
+            if np.any(reached):
+                cdf_at_t = np.max(quan_levels[reached])
+                prob_event = float(cdf_at_t * 100)  # Convert to percentage
+            else:
+                prob_event = 0.0
+            prob_at_actual_time.append(prob_event)
+        
+        individual_predictions = {
+            'fold': i,
+            'test_indices': data_test.index.tolist(),
+            'actual_times': t_test.tolist(),
+            'actual_events': e_test.tolist(),
+            'quantile_levels': quan_levels.tolist(),
+            'quantile_predictions': quan_preds.tolist(),
+            'median_predictions': median_preds,
+            'mean_predictions': mean_preds,
+            'prob_at_actual_time': prob_at_actual_time,
+            'features': x_test.tolist()
+        }
+    
     train_time = (mid_time - start_time).total_seconds()
     infer_time = (end_time - mid_time).total_seconds()
-    
-    # Evaluate performance
-    t_train_val = np.concatenate((t_train, t_val)) if t_val is not None else t_train
-    e_train_val = np.concatenate((e_train, e_val)) if e_val is not None else e_train
-    
-    # Make event times strictly increasing for PCHIP (x must be strictly increasing)
-    unique_times_fixed = make_strictly_increasing(t_test)
 
     evaler = QuantileRegEvaluator(
-        quan_preds, quan_levels, unique_times_fixed, e_test,
+        quan_preds, quan_levels, t_test, e_test,
         t_train_val, e_train_val,
         predict_time_method="Median", interpolation=args.interpolate
     )
-
-    # t17 = time.time()
-    # print(f"[Exp {i+1}] Create evaluator: {t17-t16:.3f}s")
-
 
     c_index = float(evaler.concordance(ties="All")[0])
     ibs_score = float(evaler.integrated_brier_score(num_points=10))
@@ -479,13 +396,10 @@ def train_mtlr_model(dataset_path, selected_features, args, i):
     pred_probs = evaler.predict_probability_from_curve(evaler.event_times)
     dcal_chisquare_stat, dcal_p_value = chisquare(dcal_hist)
     if data.shape[0] >= 1000:
-        wsc_xcal_score = float(wsc_xcal(X_test, e_test, pred_probs, random_state=seed))
+        wsc_xcal_score = float(wsc_xcal(x_test, e_test, pred_probs, random_state=seed))
     else:
         wsc_xcal_score = 0  # not enough data to compute the WSC
 
-    # t18 = time.time()
-    # print(f"[Exp {i+1}] Calculate metrics: {t18-t17:.3f}s")
-    # print(f"[Exp {i+1}] === TOTAL TIME: {t18-t0:.3f}s ===\n")
 
     ci.append(c_index)
     ibs.append(ibs_score)
@@ -501,29 +415,9 @@ def train_mtlr_model(dataset_path, selected_features, args, i):
     infer_times.append(infer_time)
 
 
-    # ✅ CLEANUP: Delete large objects
-    del data_train, data_val, data_test
-    del X_train, X_val, X_test
-    del y_train, y_val, y_test
-    del data_train_for_fit, data_val_for_fit, data_val_for_cal
-    del t_train, e_train, t_val, e_val, t_test, e_test
-    del quan_levels, quan_preds
-    del evaler, pred_probs
-    del model, nc_model
-    del discrete_bins, unique_times_fixed
-    
-    # ✅ Force garbage collection
-    import gc
-    gc.collect()
-    
-    # ✅ Clear PyTorch cache
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    print(f"[Exp {i+1}] Cleanup complete")
 
     
-    return icp, encoder
+    return icp, enc_df, individual_predictions
 
 
 @app.route('/health', methods=['GET'])
@@ -542,6 +436,8 @@ def serve_model_file(model_id, filename):
     if not os.path.exists(os.path.join(folder, filename)):
         return {"error": "File not found"}, 404
     return send_from_directory(folder, filename)
+
+
 
 
 @app.route('/train', methods=['POST'])
@@ -564,6 +460,8 @@ def train_model():
         "dataset_path": "/path/to/data.csv",
         "selected_features": "all",  // or ["Height", "Weight"] or null
         "parameters": {"neurons": [64, 64], "dropout": 0.1}
+        "return_cv_predictions": true  # NEW: Return individual predictions
+
     }
     """
     # Reset metrics before training
@@ -584,11 +482,12 @@ def train_model():
     dcal_hists.clear()
     n_features = 0
 
+
     try:
         # Handle dataset - either as file upload or JSON path
         dataset_path = None
         
-        # Option 1: File upload (multipart/form-data)
+        # Dataset MUST be a File upload (multipart/form-data)
         if 'dataset' in request.files:
             file = request.files['dataset']
             if file.filename == '':
@@ -604,15 +503,8 @@ def train_model():
             dataset_path = os.path.join(app.config['UPLOAD_FOLDER'], dataset_filename)
             file.save(dataset_path)
         
-        # Option 2: JSON request with dataset path
-        elif request.is_json:
-            json_data = request.json
-            dataset_path = json_data.get('dataset_path')
-            if not dataset_path or not os.path.exists(dataset_path):
-                return jsonify({'error': 'Invalid or missing dataset_path'}), 400
-        
         else:
-            return jsonify({'error': 'No dataset provided (either upload file or provide dataset_path)'}), 400
+            return jsonify({'error': 'No dataset provided. Please upload file'}), 400
         
         # Parse user-selected configuration
         parameters = request.json.get('parameters', {}) if request.is_json else \
@@ -647,6 +539,11 @@ def train_model():
         # safety: ensure n_exp is an int >= 1
         n_exp = max(1, int(getattr(args, 'n_exp', 1)))
 
+        # NEW: Check if user wants CV predictions
+        return_cv_predictions = request.json.get('return_cv_predictions', False) if request.is_json else \
+                                json.loads(request.form.get('return_cv_predictions', 'false'))
+
+
         # Create model ID
         now = datetime.now()
         model_timestamp = now.strftime("%Y%m%d_%H%M%S")
@@ -657,26 +554,67 @@ def train_model():
         # Create model dir
         model_dir = os.path.join(app.config['MODEL_FOLDER'], model_id)
         os.makedirs(model_dir, exist_ok=True)
+    
+        # NEW: Collect predictions across all folds
+        all_fold_predictions = []
 
-        
         # Training Loop 
         train_start = time.time()
         for i in trange(n_exp, disable=not args.verbose, desc='Experiment'):
-            icp, encoder = train_mtlr_model(
-                dataset_path, selected_features_for_training, args, i
+            icp, encoder, indiv_preds = train_mtlr_model(
+                dataset_path, selected_features_for_training, args, i, return_predictions=return_cv_predictions
             )
+
+            # Collect predictions
+            if indiv_preds is not None:
+                all_fold_predictions.append(indiv_preds)
 
         train_end = time.time()
 
         train_duration = train_end - train_start
 
+        # -------------------------------
+        # Aggregate individual predictions
+        # -------------------------------
+        if all_fold_predictions:
+            n_experiments = len(all_fold_predictions)
+            n_samples = len(all_fold_predictions[0]['median_predictions'])
+            n_quantiles = len(all_fold_predictions[0]['quantile_levels'])
+
+            # Initialize arrays
+            avg_median_preds = np.zeros(n_samples)
+            avg_mean_preds = np.zeros(n_samples)
+            avg_prob_at_t = np.zeros(n_samples)
+            avg_quan_preds = np.zeros((n_samples, n_quantiles))
+
+            for preds in all_fold_predictions:
+                avg_median_preds += np.array(preds['median_predictions'])
+                avg_mean_preds += np.array(preds['mean_predictions'])
+                avg_prob_at_t += np.array(preds['prob_at_actual_time'])
+                avg_quan_preds += np.array(preds['quantile_predictions'])
+
+            # Compute averages
+            avg_median_preds /= n_experiments
+            avg_mean_preds /= n_experiments
+            avg_prob_at_t /= n_experiments
+            avg_quan_preds /= n_experiments
+
+            aggregated_predictions = {
+                'test_indices': all_fold_predictions[0]['test_indices'],
+                'actual_times': all_fold_predictions[0]['actual_times'],
+                'actual_events': all_fold_predictions[0]['actual_events'],
+                'median_predictions': avg_median_preds.tolist(),
+                'mean_predictions': avg_mean_preds.tolist(),
+                'prob_at_actual_time': avg_prob_at_t.tolist(),
+                'quantile_levels': all_fold_predictions[0]['quantile_levels'],
+                'quantile_predictions': avg_quan_preds.tolist()
+            }
+        else:
+            aggregated_predictions = None
+
         # ----------------------------
         # Save artifacts
         # ----------------------------
-
-        # Save model weights (state_dict)
-        model_path = os.path.join(model_dir, "model_weights.pth")
-        torch.save({"model_state_dict": icp.nc_function.model.state_dict()}, model_path)
         
         # Save model config (only model architecture params, NOT selected_features)
         model_config = {
@@ -712,6 +650,16 @@ def train_model():
         icp_state_path = os.path.join(model_dir, "icp_state.dill")
         with open(icp_state_path, "wb") as f:
             dill.dump(icp, f)
+    
+        # NEW: Save CV predictions if requested
+        if return_cv_predictions and aggregated_predictions:
+            cv_predictions_path = os.path.join(model_dir, "cv_predictions.json")
+            with open(cv_predictions_path, 'w') as f:
+                json.dump(aggregated_predictions, f, indent=2)
+            
+            # Also create a summary CSV for easy analysis
+            cv_summary_path = os.path.join(model_dir, "cv_predictions_summary.csv")
+            create_cv_summary_csv(aggregated_predictions, cv_summary_path)
 
         # Save metrics
         metrics = print_performance(
@@ -735,19 +683,28 @@ def train_model():
         base_url = request.host_url.rstrip("/")  # e.g., http://localhost:5000
        
 
-        return jsonify({
+        response_data = {
             "status": "success",
             "model_id": model_id,
             "metrics": metrics,
-            "selected_features": selected_features,  # Return as 'all', list, or None
-            "model_weights": f"{base_url}/models/{model_id}/model_weights.pth",
-            "encoder": f"{base_url}/models/{model_id}/encoder.joblib",
-            "icp_state": f"{base_url}/models/{model_id}/icp_state.dill",
+            "selected_features": selected_features,
             "model_config": f"{base_url}/models/{model_id}/model_config.json",
             "trained_at": model_timestamp_date,
             "train_duration": train_duration,
             "timestamp": datetime.now().isoformat()
-        }), 200
+        }
+        
+        # NEW: Add CV predictions to response
+        if return_cv_predictions and aggregated_predictions:
+            response_data["cv_predictions"] = {
+                "summary_csv": f"{base_url}/models/{model_id}/cv_predictions_summary.csv",
+                "full_predictions": f"{base_url}/models/{model_id}/cv_predictions.json",
+                "n_folds": len(all_fold_predictions),  # total experiments/folds
+                "total_predictions": len(aggregated_predictions['actual_times'])  # total test samples
+            }
+
+
+        return jsonify(response_data), 200
 
 
     except Exception as e:
@@ -767,9 +724,11 @@ def retrain_model():
     Expected JSON request:
     {
         "model_id": "mtlr_20231103_120000_abc123",  # REQUIRED - existing model to retrain
-        "dataset_path": "/path/to/data.csv",        # Can use same or different dataset
+        "dataset_path": "/path/to/data.csv",        # OPTIONAL - Input to use different dataset from parent predictor model
         "selected_features": "all",                  # OPTIONAL - see feature selection logic below
         "parameters": {"neurons": [64, 64], "dropout": 0.1}  # Optional parameter overrides
+        "return_cv_predictions": true  # NEW: Return individual predictions
+
     }
     
     Feature Selection Logic:
@@ -835,15 +794,52 @@ def retrain_model():
             }
         
         # Dataset Override Logic
-        dataset_path_input = json_data.get("dataset_path")
-        if dataset_path_input:
-            dataset_path = dataset_path_input
-        else:
-            # Just pull the dataset from the original model's training metadata)
-            dataset_path = original_metadata.get("dataset_path")
 
+        file = None
+        try:
+            file = request.files.get("dataset")
+        except Exception:
+            # request.files may not exist or parsing failed (JSON-only request)
+            file = None
+
+        if file:
+            if file.filename == "":
+                return jsonify({"error": "No dataset file selected"}), 400
+
+            if not file.filename.lower().endswith(".csv"):
+                return jsonify({"error": "Dataset file must be a CSV"}), 400
+
+            # ✅ Save uploaded dataset file
+            filename = secure_filename(file.filename)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            dataset_filename = f"{timestamp}_{filename}"
+            dataset_path = os.path.join(app.config["UPLOAD_FOLDER"], dataset_filename)
+            file.save(dataset_path)
+
+        else:
+            # ✅ Fallback: use dataset path from metadata or JSON
+            dataset_path = (
+                request.json.get("dataset_path")
+                if request.is_json else None
+            ) or original_metadata.get("dataset_path")
+
+        # ✅ Final validation
         if not dataset_path:
-            return jsonify({"error": "dataset_path missing and not found in parent model metadata"}), 400
+            return jsonify({"error": "Dataset missing: upload a CSV or provide dataset_path"}), 400
+
+        
+        # dataset_path_input = json_data.get("dataset_path")
+        # if dataset_path_input:
+        #     dataset_path = dataset_path_input
+        # else:
+        #     # Just pull the dataset from the original model's training metadata)
+        #     dataset_path = original_metadata.get("dataset_path")
+
+        # if not dataset_path:
+        #     return jsonify({"error": "dataset_path missing and not found in parent model metadata"}), 400
+
+        
+            
        
         # Feature Selection Logic
         selected_features_input = json_data.get('selected_features', 'inherit')
@@ -895,6 +891,9 @@ def retrain_model():
         args = Args(config)
         n_exp = max(1, int(getattr(args, 'n_exp', 1)))
 
+        # NEW: Check if user wants CV predictions
+        return_cv_predictions = json_data.get('return_cv_predictions', False)
+
         # Create NEW model ID for the retrained version
         now = datetime.now()
         model_timestamp = now.strftime("%Y%m%d_%H%M%S")
@@ -905,12 +904,57 @@ def retrain_model():
         model_dir = os.path.join(app.config['MODEL_FOLDER'], new_model_id)
         os.makedirs(model_dir, exist_ok=True)
 
+        # NEW: Collect predictions across all folds
+        all_fold_predictions = []
+
         # Training Loop 
         train_start = time.time()
         for i in trange(n_exp, disable=not args.verbose, desc='Experiment'):
-            icp, encoder = train_mtlr_model(
-                dataset_path, selected_features_for_training, args, i
+            icp, encoder, indiv_preds = train_mtlr_model(
+                dataset_path, selected_features_for_training, args, i, return_predictions=return_cv_predictions
             )
+
+            if indiv_preds:
+                all_fold_predictions.append(indiv_preds)
+        
+        # -------------------------------
+        # Aggregate individual predictions
+        # -------------------------------
+        if all_fold_predictions:
+            n_experiments = len(all_fold_predictions)
+            n_samples = len(all_fold_predictions[0]['median_predictions'])
+            n_quantiles = len(all_fold_predictions[0]['quantile_levels'])
+
+            # Initialize arrays
+            avg_median_preds = np.zeros(n_samples)
+            avg_mean_preds = np.zeros(n_samples)
+            avg_prob_at_t = np.zeros(n_samples)
+            avg_quan_preds = np.zeros((n_samples, n_quantiles))
+
+            for preds in all_fold_predictions:
+                avg_median_preds += np.array(preds['median_predictions'])
+                avg_mean_preds += np.array(preds['mean_predictions'])
+                avg_prob_at_t += np.array(preds['prob_at_actual_time'])
+                avg_quan_preds += np.array(preds['quantile_predictions'])
+
+            # Compute averages
+            avg_median_preds /= n_experiments
+            avg_mean_preds /= n_experiments
+            avg_prob_at_t /= n_experiments
+            avg_quan_preds /= n_experiments
+
+            aggregated_predictions = {
+                'test_indices': all_fold_predictions[0]['test_indices'],
+                'actual_times': all_fold_predictions[0]['actual_times'],
+                'actual_events': all_fold_predictions[0]['actual_events'],
+                'median_predictions': avg_median_preds.tolist(),
+                'mean_predictions': avg_mean_preds.tolist(),
+                'prob_at_actual_time': avg_prob_at_t.tolist(),
+                'quantile_levels': all_fold_predictions[0]['quantile_levels'],
+                'quantile_predictions': avg_quan_preds.tolist()
+            }
+        else:
+            aggregated_predictions = None
 
         train_end = time.time()
         train_duration = train_end - train_start
@@ -918,10 +962,6 @@ def retrain_model():
         # ----------------------------
         # Save artifacts
         # ----------------------------
-
-        # Save model weights (state_dict)
-        model_path = os.path.join(model_dir, "model_weights.pth")
-        torch.save({"model_state_dict": icp.nc_function.model.state_dict()}, model_path)
 
         # Track what changed in this retrain
         retrain_history = {
@@ -974,6 +1014,16 @@ def retrain_model():
         icp_state_path = os.path.join(model_dir, "icp_state.dill")
         with open(icp_state_path, "wb") as f:
             dill.dump(icp, f)
+        
+         # NEW: Save CV predictions if requested
+        if return_cv_predictions and aggregated_predictions:
+            cv_predictions_path = os.path.join(model_dir, "cv_predictions.json")
+            with open(cv_predictions_path, 'w') as f:
+                json.dump(aggregated_predictions, f, indent=2)
+            
+            # Also create a summary CSV for easy analysis
+            cv_summary_path = os.path.join(model_dir, "cv_predictions_summary.csv")
+            create_cv_summary_csv(aggregated_predictions, cv_summary_path)
 
         metrics = print_performance(
             Cindex=ci,
@@ -994,16 +1044,13 @@ def retrain_model():
 
         base_url = request.host_url.rstrip("/")
 
-        return jsonify({
+        response_data = {
             "status": "success",
             "model_id": new_model_id,
             "parent_model_id": model_id,
             "metrics": metrics,
-            "selected_features": selected_features,  # Return as 'all', list, or None
-            "model_weights": f"{base_url}/models/{new_model_id}/model_weights.pth",
-            "encoder": f"{base_url}/models/{new_model_id}/encoder.joblib",
-            "icp_state": f"{base_url}/models/{new_model_id}/icp_state.dill",
-            "model_config": f"{base_url}/models/{new_model_id}/model_config.json",
+            "selected_features": selected_features,
+            "model_config": f"{base_url}/models/{model_id}/model_config.json",
             "trained_at": model_timestamp_date,
             "train_duration": train_duration,
             "retrained_from": model_id,
@@ -1013,7 +1060,18 @@ def retrain_model():
                 "features_source": features_source
             },
             "timestamp": datetime.now().isoformat()
-        }), 200
+        }
+
+        # NEW: Add CV predictions to response
+        if return_cv_predictions and aggregated_predictions:
+            response_data["cv_predictions"] = {
+                "summary_csv": f"{base_url}/models/{new_model_id}/cv_predictions_summary.csv",
+                "full_predictions": f"{base_url}/models/{new_model_id}/cv_predictions.json",
+                "n_folds": len(all_fold_predictions),
+                "total_predictions": len(aggregated_predictions['actual_times'])
+            }
+
+        return jsonify(response_data), 200
 
     except Exception as e:
         return jsonify({
@@ -1025,16 +1083,18 @@ def retrain_model():
 @app.route('/predict', methods=['POST'])
 def predict():
     """
-    Make predictions using a trained model
+    Make predictions using a trained model with conformal prediction intervals
     
     Expected JSON:
     {
-        "model_id": "mtlr_20231101_120000",
+        "model_id": "mtlr_20231101_120000_abc123",
         "features": {
             "feature1": value1,
             "feature2": value2,
             ...
-        }
+        },
+        "time_points": [0.5, 1, 1.5, 2, 2.5, 3],  # Optional: specific times for survival curve
+        "alpha": 0.1  # Optional: significance level (default 0.1 for 90% prediction interval)
     }
     """
     try:
@@ -1044,38 +1104,94 @@ def predict():
             return jsonify({'error': 'Missing model_id or features'}), 400
         
         model_id = data['model_id']
-        model_path = os.path.join(app.config['MODEL_FOLDER'], f'{model_id}.pkl')
+        model_dir = os.path.join(app.config['MODEL_FOLDER'], model_id)
         
-        if not os.path.exists(model_path):
-            return jsonify({'error': 'Model not found'}), 404
+        if not os.path.exists(model_dir):
+            return jsonify({'error': f'Model {model_id} not found'}), 404
         
-        # Load model
-        with open(model_path, 'rb') as f:
-            model_data = pickle.load(f)
+        # Load encoder
+        encoder_path = os.path.join(model_dir, 'encoder.joblib')
+        encoder = joblib.load(encoder_path)
         
-        icp = model_data['icp']
-        encoder = model_data['encoder']
+        # Load ICP state (contains calibrated conformal scores)
+        icp_state_path = os.path.join(model_dir, 'icp_state.dill')
+        with open(icp_state_path, 'rb') as f:
+            icp = dill.load(f)
         
-        # Prepare input data
+        # Prepare input data as DataFrame
         input_df = pd.DataFrame([data['features']])
         
         # Transform using encoder
-        input_transformed = encoder.transform(input_df).values
+        input_transformed = encoder.transform(input_df)
         
-        # Make prediction
-        quan_levels, quan_preds = icp.predict(input_transformed)
+        # Extract only feature columns
+        feature_cols = [col for col in input_transformed.columns if col not in ['time', 'event']]
+        x_input = input_transformed[feature_cols].values
+        
+        # Make prediction using ICP (conformal prediction)
+        # This returns calibrated quantile predictions
+        quan_levels, quan_preds = icp.predict(x_input)
+        
+        # quan_levels: array of quantile levels [0.01, 0.02, ..., 0.99]
+        # quan_preds: shape (1, n_quantiles) - time at which each quantile is reached
+        
+        # Get time points for survival curve
+        time_points = data.get('time_points', None)
+        if time_points is None:
+            # Create a grid of time points from 0 to max predicted time
+            max_time = np.max(quan_preds[0])
+            time_points = np.linspace(0, max_time, 100)
+        else:
+            time_points = np.array(time_points)
+        
+        # Convert quantile predictions to survival probabilities
+        # The quantile predictions give us the full survival distribution
+        survival_probs = convert_quantiles_to_survival(
+            quan_levels, quan_preds[0], time_points
+        )
+        
+        # Calculate median survival time (50th percentile)
+        median_idx = np.argmin(np.abs(quan_levels - 0.5))
+        median_survival = float(quan_preds[0, median_idx])
+        
+        # Calculate prediction intervals at specific confidence levels
+        # For plotting uncertainty bands like in the image
+        alpha = data.get('alpha', 0.1)  # 90% prediction interval by default
+        
+        # Get lower and upper bounds for survival curve
+        # These come from the quantile predictions at different confidence levels
+        lower_bound_survival = convert_quantiles_to_survival(
+            quan_levels, quan_preds[0], time_points, bound='lower', alpha=alpha
+        )
+        upper_bound_survival = convert_quantiles_to_survival(
+            quan_levels, quan_preds[0], time_points, bound='upper', alpha=alpha
+        )
         
         # Format response
         predictions = {
-            'quantile_levels': quan_levels.tolist(),
-            'quantile_predictions': quan_preds[0].tolist(),
-            'median_survival_time': float(quan_preds[0][len(quan_preds[0])//2])
+            'survival_curve': {
+                'time_points': time_points.tolist(),
+                'survival_probabilities': survival_probs.tolist(),
+                'lower_bound': lower_bound_survival.tolist(),
+                'upper_bound': upper_bound_survival.tolist(),
+                'confidence_level': 1 - alpha
+            },
+            'quantile_predictions': {
+                'quantile_levels': quan_levels.tolist(),
+                'time_points': quan_preds[0].tolist()
+            },
+            'key_statistics': {
+                'median_survival_time': median_survival,
+                '25th_percentile': float(quan_preds[0, np.argmin(np.abs(quan_levels - 0.25))]),
+                '75th_percentile': float(quan_preds[0, np.argmin(np.abs(quan_levels - 0.75))])
+            }
         }
         
         return jsonify({
             'status': 'success',
             'predictions': predictions,
-            'model_id': model_id
+            'model_id': model_id,
+            'timestamp': datetime.now().isoformat()
         }), 200
     
     except Exception as e:
@@ -1084,6 +1200,49 @@ def predict():
             'error': str(e),
             'error_type': type(e).__name__
         }), 500
+
+
+def convert_quantiles_to_survival(quantile_levels, quantile_times, time_points, 
+                                   bound='median', alpha=0.1):
+    """
+    Convert quantile predictions to survival probabilities with uncertainty bounds
+    
+    Parameters:
+    -----------
+    quantile_levels : array, shape (n_quantiles,)
+        Quantile levels (e.g., [0.01, 0.02, ..., 0.99])
+    quantile_times : array, shape (n_quantiles,)
+        Time at which each quantile is reached
+    time_points : array, shape (n_timepoints,)
+        Time points at which to evaluate survival
+    bound : str, one of ['lower', 'median', 'upper']
+        Which bound of the prediction interval to return
+    alpha : float
+        Significance level for prediction intervals
+        
+    Returns:
+    --------
+    survival_probs : array, shape (n_timepoints,)
+        Survival probability S(t) at each time point
+    """
+    survival_probs = np.ones(len(time_points))
+    
+    for i, t in enumerate(time_points):
+        # Find the fraction of the distribution that has experienced the event by time t
+        # This is the CDF: F(t) = P(T <= t)
+        reached = quantile_times <= t
+        
+        if np.any(reached):
+            # The CDF at time t is the largest quantile level reached
+            cdf_at_t = np.max(quantile_levels[reached])
+            
+            # Survival function is complement of CDF: S(t) = 1 - F(t)
+            survival_probs[i] = 1.0 - cdf_at_t
+        else:
+            # No events have occurred yet
+            survival_probs[i] = 1.0
+    
+    return survival_probs
 
 
 @app.route('/model/<model_id>', methods=['GET'])
@@ -1211,6 +1370,41 @@ def list_models():
             'error': str(e),
             'error_type': type(e).__name__
         }), 500
+
+
+def create_cv_summary_csv(aggregated_predictions, output_path):
+    """
+    Create CSV summary from aggregated predictions.
+
+    Parameters:
+    - aggregated_predictions: dict returned from aggregation, with keys:
+        'test_indices', 'actual_times', 'actual_events',
+        'median_predictions', 'mean_predictions', 'prob_at_actual_time',
+        'quantile_levels', 'quantile_predictions'
+    - output_path: path to save the CSV
+    """
+    rows = []
+
+    n_samples = len(aggregated_predictions['actual_times'])
+
+    for i in range(n_samples):
+        row = {
+            'identifier': aggregated_predictions['test_indices'][i],
+            'censored': 'yes' if aggregated_predictions['actual_events'][i] == 0 else 'no',
+            'event_time': aggregated_predictions['actual_times'][i],
+            'predicted_prob_event': aggregated_predictions['prob_at_actual_time'][i],
+            'predicted_median_survival': aggregated_predictions['median_predictions'][i],
+            'predicted_mean_survival': aggregated_predictions['mean_predictions'][i],
+            'absolute_error': abs(aggregated_predictions['median_predictions'][i] - aggregated_predictions['actual_times'][i])
+                              if aggregated_predictions['actual_events'][i] == 1 else None
+        }
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    df.to_csv(output_path, index=False)
+
+    return df
+
 
 
 if __name__ == '__main__':
