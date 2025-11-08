@@ -689,6 +689,10 @@ def train_model():
             "metrics": metrics,
             "selected_features": selected_features,
             "model_config": f"{base_url}/models/{model_id}/model_config.json",
+            "model_file": {
+                "encoder": f"{base_url}/models/{model_id}/encoder.joblib",
+                "icp_state": f"{base_url}/models/{model_id}/icp_state.dill",
+            },
             "trained_at": model_timestamp_date,
             "train_duration": train_duration,
             "timestamp": datetime.now().isoformat()
