@@ -19,6 +19,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.compose import make_column_selector, ColumnTransformer
 from scipy.stats import chisquare
 import statistics
+from flask_cors import CORS 
+
 
 # Import models and utilities
 from model import MTLR
@@ -35,6 +37,8 @@ app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MODEL_FOLDER'] = 'trained_models'
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
+CORS(app, origins=["http://localhost:5174", "http://localhost:5173"], supports_credentials=True)
+
 
 # Create necessary directories
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -507,28 +511,14 @@ def train_model():
             return jsonify({'error': 'No dataset provided. Please upload file'}), 400
         
         # Parse user-selected configuration
-        parameters = request.json.get('parameters', {}) if request.is_json else \
-                     json.loads(request.form.get('parameters', '{}'))
-        
-        # Parse selected features with new logic
-        selected_features_input = request.json.get('selected_features', None) if request.is_json else \
-                                   json.loads(request.form.get('selected_features', 'null'))
+        parameters = json.loads(request.form.get('parameters', '{}'))
 
-        # Feature Selection Logic
-        if selected_features_input == 'all':
-            # All features selected
-            selected_features = 'all'
-            selected_features_for_training = None  # None means use all in prepare_data
-        elif isinstance(selected_features_input, list) and len(selected_features_input) > 0:
-            # Specific features selected
-            selected_features = selected_features_input
-            selected_features_for_training = selected_features_input
-        else:
-            # No features selected (None or empty) - default to all
-            selected_features = 'all'
-            selected_features_for_training = None
 
-        config = {'selected_features': selected_features_for_training} 
+        # Train on all features by default
+        selected_features = 'all'
+        selected_features_for_training = None
+
+        config = {'selected_features': selected_features} 
         
         # Merge parameters into config
         config.update(parameters)
@@ -539,15 +529,11 @@ def train_model():
         # safety: ensure n_exp is an int >= 1
         n_exp = max(1, int(getattr(args, 'n_exp', 1)))
 
-        # NEW: Check if user wants CV predictions
-        return_cv_predictions = request.json.get('return_cv_predictions', False) if request.is_json else \
-                                json.loads(request.form.get('return_cv_predictions', 'false'))
-
 
         # Create model ID
         now = datetime.now()
         model_timestamp = now.strftime("%Y%m%d_%H%M%S")
-        model_timestamp_date = now.date().isoformat()
+        model_timestamp_date = now.isoformat()  # e.g., "2025-11-09T15:45:30+00:00"
         suffix = uuid.uuid4().hex[:6]  # 6-character random ID
         model_id = f"mtlr_{model_timestamp}_{suffix}"
 
@@ -562,8 +548,7 @@ def train_model():
         train_start = time.time()
         for i in trange(n_exp, disable=not args.verbose, desc='Experiment'):
             icp, encoder, indiv_preds = train_mtlr_model(
-                dataset_path, selected_features_for_training, args, i, return_predictions=return_cv_predictions
-            )
+                dataset_path, selected_features_for_training, args, i, return_predictions=True)
 
             # Collect predictions
             if indiv_preds is not None:
@@ -632,7 +617,7 @@ def train_model():
         
         # Save training metadata separately (includes selected_features)
         training_metadata = {
-            "selected_features": selected_features,  # Store as 'all', list, or None
+            "selected_features": selected_features,  # Store as 'all' for training
             "dataset_path": dataset_path,
             "n_experiments": n_exp,
             "timestamp": model_timestamp_date
@@ -728,8 +713,6 @@ def retrain_model():
         "dataset_path": "/path/to/data.csv",        # OPTIONAL - Input to use different dataset from parent predictor model
         "selected_features": "all",                  # OPTIONAL - see feature selection logic below
         "parameters": {"neurons": [64, 64], "dropout": 0.1}  # Optional parameter overrides
-        "return_cv_predictions": true  # NEW: Return individual predictions
-
     }
     
     Feature Selection Logic:
@@ -892,9 +875,6 @@ def retrain_model():
         args = Args(config)
         n_exp = max(1, int(getattr(args, 'n_exp', 1)))
 
-        # NEW: Check if user wants CV predictions
-        return_cv_predictions = json_data.get('return_cv_predictions', False)
-
         # Create NEW model ID for the retrained version
         now = datetime.now()
         model_timestamp = now.strftime("%Y%m%d_%H%M%S")
@@ -912,7 +892,7 @@ def retrain_model():
         train_start = time.time()
         for i in trange(n_exp, disable=not args.verbose, desc='Experiment'):
             icp, encoder, indiv_preds = train_mtlr_model(
-                dataset_path, selected_features_for_training, args, i, return_predictions=return_cv_predictions
+                dataset_path, selected_features_for_training, args, i, return_predictions=True
             )
 
             if indiv_preds:
