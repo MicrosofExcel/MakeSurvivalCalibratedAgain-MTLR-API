@@ -119,7 +119,7 @@ def prepare_data(dataset_path, selected_features=None, args=None):
     # Filter selected features
     feature_columns = [col for col in data.columns if col not in ['time', 'event']]
     if selected_features:
-        missing_features = [f for f in selected_features if f not in feature_columns]
+        missing_features = [f for f in selected_features if f not in feature_columns]   
         if missing_features:
             raise ValueError(f"Features not found: {missing_features}")
         feature_columns = selected_features
@@ -525,7 +525,7 @@ def train_model():
             selected_features_for_training = selected_features_input
         else:
             # No features selected (None or empty) - default to all
-            selected_features = None
+            selected_features = 'all'
             selected_features_for_training = None
 
         config = {'selected_features': selected_features_for_training} 
@@ -651,15 +651,14 @@ def train_model():
         with open(icp_state_path, "wb") as f:
             dill.dump(icp, f)
     
-        # NEW: Save CV predictions if requested
-        if return_cv_predictions and aggregated_predictions:
-            cv_predictions_path = os.path.join(model_dir, "cv_predictions.json")
-            with open(cv_predictions_path, 'w') as f:
-                json.dump(aggregated_predictions, f, indent=2)
+        # Save CV_predictions
+        cv_predictions_path = os.path.join(model_dir, "cv_predictions.json")
+        with open(cv_predictions_path, 'w') as f:
+            json.dump(aggregated_predictions, f, indent=2)
             
-            # Also create a summary CSV for easy analysis
-            cv_summary_path = os.path.join(model_dir, "cv_predictions_summary.csv")
-            create_cv_summary_csv(aggregated_predictions, cv_summary_path)
+        # Also create a summary CSV for easy analysis
+        cv_summary_path = os.path.join(model_dir, "cv_predictions_summary.csv")
+        create_cv_summary_csv(aggregated_predictions, cv_summary_path)
 
         # Save metrics
         metrics = print_performance(
@@ -693,19 +692,17 @@ def train_model():
                 "encoder": f"{base_url}/models/{model_id}/encoder.joblib",
                 "icp_state": f"{base_url}/models/{model_id}/icp_state.dill",
             },
+            "cv_predictions": {
+                "summary_csv": f"{base_url}/models/{model_id}/cv_predictions_summary.csv",
+                "full_predictions": f"{base_url}/models/{model_id}/cv_predictions.json",
+                "n_folds": len(all_fold_predictions),  # total experiments/folds
+                "total_predictions": len(aggregated_predictions['actual_times'])  # total test samples
+            },
             "trained_at": model_timestamp_date,
             "train_duration": train_duration,
             "timestamp": datetime.now().isoformat()
         }
         
-        # NEW: Add CV predictions to response
-        if return_cv_predictions and aggregated_predictions:
-            response_data["cv_predictions"] = {
-                "summary_csv": f"{base_url}/models/{model_id}/cv_predictions_summary.csv",
-                "full_predictions": f"{base_url}/models/{model_id}/cv_predictions.json",
-                "n_folds": len(all_fold_predictions),  # total experiments/folds
-                "total_predictions": len(aggregated_predictions['actual_times'])  # total test samples
-            }
 
 
         return jsonify(response_data), 200
@@ -1019,15 +1016,14 @@ def retrain_model():
         with open(icp_state_path, "wb") as f:
             dill.dump(icp, f)
         
-         # NEW: Save CV predictions if requested
-        if return_cv_predictions and aggregated_predictions:
-            cv_predictions_path = os.path.join(model_dir, "cv_predictions.json")
-            with open(cv_predictions_path, 'w') as f:
-                json.dump(aggregated_predictions, f, indent=2)
+        # Save CV Predictions
+        cv_predictions_path = os.path.join(model_dir, "cv_predictions.json")
+        with open(cv_predictions_path, 'w') as f:
+            json.dump(aggregated_predictions, f, indent=2)
             
-            # Also create a summary CSV for easy analysis
-            cv_summary_path = os.path.join(model_dir, "cv_predictions_summary.csv")
-            create_cv_summary_csv(aggregated_predictions, cv_summary_path)
+        # Also create a summary CSV for easy analysis
+        cv_summary_path = os.path.join(model_dir, "cv_predictions_summary.csv")
+        create_cv_summary_csv(aggregated_predictions, cv_summary_path)
 
         metrics = print_performance(
             Cindex=ci,
@@ -1062,6 +1058,12 @@ def retrain_model():
             "trained_at": model_timestamp_date,
             "train_duration": train_duration,
             "retrained_from": model_id,
+            "cv_predictions": {
+                "summary_csv": f"{base_url}/models/{new_model_id}/cv_predictions_summary.csv",
+                "full_predictions": f"{base_url}/models/{new_model_id}/cv_predictions.json",
+                "n_folds": len(all_fold_predictions),
+                "total_predictions": len(aggregated_predictions['actual_times'])
+            },
             "retrain_summary": {
                 "features_changed": retrain_history['features_changed'],
                 "parameters_changed": list(retrain_history['parameter_changes'].keys()),
@@ -1069,15 +1071,6 @@ def retrain_model():
             },
             "timestamp": datetime.now().isoformat()
         }
-
-        # NEW: Add CV predictions to response
-        if return_cv_predictions and aggregated_predictions:
-            response_data["cv_predictions"] = {
-                "summary_csv": f"{base_url}/models/{new_model_id}/cv_predictions_summary.csv",
-                "full_predictions": f"{base_url}/models/{new_model_id}/cv_predictions.json",
-                "n_folds": len(all_fold_predictions),
-                "total_predictions": len(aggregated_predictions['actual_times'])
-            }
 
         return jsonify(response_data), 200
 
