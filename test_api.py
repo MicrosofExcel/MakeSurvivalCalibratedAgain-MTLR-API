@@ -24,8 +24,14 @@ import os
 import argparse
 from typing import List, Optional
 
+from env_loader import load_env_file
 
-def test_health(api_url: str = 'http://localhost:5000') -> bool:
+
+load_env_file()
+DEFAULT_API_URL = os.getenv('API_URL', 'http://localhost:5000')
+
+
+def test_health(api_url: str = DEFAULT_API_URL) -> bool:
     """Test if API is running"""
     try:
         response = requests.get(f'{api_url}/health', timeout=5)
@@ -51,7 +57,7 @@ def test_health(api_url: str = 'http://localhost:5000') -> bool:
 def test_training(
     dataset_path: str,
     features: Optional[List[str]] = None,
-    api_url: str = 'http://localhost:5000',
+    api_url: str = DEFAULT_API_URL,
     neurons: List[int] = [64, 64],
     dropout: float = 0.2,
     seed: int = 42,
@@ -166,7 +172,7 @@ def test_retrain(
     model_id: str,
     selected_features=None,
     parameters: dict = None,
-    api_url: str = 'http://localhost:5000',
+    api_url: str = DEFAULT_API_URL,
 ) -> Optional[str]:
     """Test retraining an existing model"""
 
@@ -220,7 +226,7 @@ def test_retrain(
 
 
 
-def test_list_models(api_url: str = 'http://localhost:5000') -> None:
+def test_list_models(api_url: str = DEFAULT_API_URL) -> None:
     """List all trained models"""
     print(f"\n📋 Listing trained models...")
     
@@ -250,7 +256,7 @@ def test_list_models(api_url: str = 'http://localhost:5000') -> None:
 def test_predict(
     model_id: str,
     features: dict,
-    api_url: str = 'http://localhost:5000'
+    api_url: str = DEFAULT_API_URL
 ) -> None:
     """Test prediction with a trained model"""
     print(f"\n🔮 Testing prediction with model: {model_id}")
@@ -305,7 +311,7 @@ Examples:
     parser.add_argument('--features', help='Comma-separated list of feature names')
     parser.add_argument('--time-col', default='time', help='Name of time column (default: time)')
     parser.add_argument('--event-col', default='event', help='Name of event column (default: event)')
-    parser.add_argument('--api-url', default='http://localhost:5000', help='API base URL')
+    parser.add_argument('--api-url', default=DEFAULT_API_URL, help='API base URL')
     parser.add_argument('--neurons', default='64,64', help='Hidden layer sizes (default: 64,64)')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate (default: 0.1)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed (default: 42)')

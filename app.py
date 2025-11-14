@@ -19,7 +19,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.compose import make_column_selector, ColumnTransformer
 from scipy.stats import chisquare
 import statistics
-from flask_cors import CORS 
+from flask_cors import CORS
+
+from env_loader import load_env_file
 
 
 # Import models and utilities
@@ -32,12 +34,35 @@ from SurvivalEVAL import QuantileRegEvaluator
 from CondCalEvaluation import wsc_xcal
 
 
+load_env_file()
+
+
+def _safe_int(value, fallback):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+DEFAULT_CORS = "http://localhost:5174,http://localhost:5173"
+API_HOST = os.getenv("API_HOST", "localhost")
+API_PORT = _safe_int(os.getenv("API_PORT"), 5000)
+API_URL = os.getenv("API_URL", f"http://{API_HOST}:{API_PORT}")
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", DEFAULT_CORS).split(",")
+    if origin.strip()
+]
+
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MODEL_FOLDER'] = 'trained_models'
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
-CORS(app, origins=["http://localhost:5174", "http://localhost:5173"], supports_credentials=True)
+app.config['API_HOST'] = API_HOST
+app.config['API_PORT'] = API_PORT
+app.config['API_URL'] = API_URL
+CORS(app, origins=CORS_ORIGINS, supports_credentials=True)
 
 
 # Create necessary directories
@@ -1389,4 +1414,4 @@ def create_cv_summary_csv(aggregated_predictions, output_path):
 
 
 if __name__ == '__main__':
-    app.run(debug=True, host='localhost', port=5000)
+    app.run(debug=True, host=API_HOST, port=API_PORT)
