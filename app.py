@@ -122,7 +122,14 @@ def prepare_data(dataset_path, selected_features=None, args=None):
 
     # Filter selected features
     feature_columns = [col for col in data.columns if col not in ['time', 'event']]
+    
+    # Define survival columns
+    SURVIVAL_COLS = {'time', 'event', 'censored'}
     if selected_features:
+        # Removes survival columns silently
+        selected_features = [f for f in selected_features if f not in SURVIVAL_COLS]
+
+        # Check for missing features now
         missing_features = [f for f in selected_features if f not in feature_columns]   
         if missing_features:
             raise ValueError(f"Features not found: {missing_features}")
