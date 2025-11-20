@@ -19,7 +19,10 @@ from sklearn.pipeline import Pipeline
 from sklearn.compose import make_column_selector, ColumnTransformer
 from scipy.stats import chisquare
 import statistics
-from flask_cors import CORS 
+from collections import defaultdict
+from flask_cors import CORS
+
+from env_loader import load_env_file
 
 
 # Import models and utilities
@@ -32,12 +35,35 @@ from SurvivalEVAL import QuantileRegEvaluator
 from CondCalEvaluation import wsc_xcal
 
 
+load_env_file()
+
+
+def _safe_int(value, fallback):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+DEFAULT_CORS = "http://localhost:5174,http://localhost:5173"
+API_HOST = os.getenv("API_HOST", "localhost")
+API_PORT = _safe_int(os.getenv("API_PORT"), 5000)
+API_URL = os.getenv("API_URL", f"http://{API_HOST}:{API_PORT}")
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", DEFAULT_CORS).split(",")
+    if origin.strip()
+]
+
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MODEL_FOLDER'] = 'trained_models'
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
-CORS(app, origins=["http://localhost:5174", "http://localhost:5173"], supports_credentials=True)
+app.config['API_HOST'] = API_HOST
+app.config['API_PORT'] = API_PORT
+app.config['API_URL'] = API_URL
+CORS(app, origins=CORS_ORIGINS, supports_credentials=True)
 
 
 # Create necessary directories
@@ -353,27 +379,9 @@ def train_mtlr_model(dataset_path, selected_features, args, i, return_prediction
         mean_preds = []
         prob_at_actual_time = []
         
-        for j in range(len(t_test)):
-            # Median prediction (50th percentile)
-            median_idx = np.argmin(np.abs(quan_levels - 0.5))
-            median_pred = float(quan_preds[j, median_idx])
-            median_preds.append(median_pred)
-            
-            # Mean prediction (integrate over survival curve)
-            # Mean = integral of S(t) dt
-            mean_pred = np.trapezoid(1 - quan_levels, quan_preds[j])
-            mean_preds.append(float(mean_pred))
-            
-            # Probability of event at actual time
-            actual_t = t_test[j]
-            # Find CDF at actual time
-            reached = quan_preds[j] <= actual_t
-            if np.any(reached):
-                cdf_at_t = np.max(quan_levels[reached])
-                prob_event = float(cdf_at_t * 100)  # Convert to percentage
-            else:
-                prob_event = 0.0
-            prob_at_actual_time.append(prob_event)
+        median_preds, mean_preds, prob_at_actual_time = summarize_prediction_stats(
+            quan_levels, quan_preds, t_test
+        )
         
         individual_predictions = {
             'fold': i,
@@ -448,6 +456,26 @@ def serve_model_file(model_id, filename):
         return {"error": "File not found"}, 404
     return send_from_directory(folder, filename)
 
+
+
+@app.route("/models/<model_id>/cv_predictions", methods=['GET'])
+def get_cv_predictions_file(model_id):
+    """Serve the per-fold aggregated cv_predictions.json for a model."""
+    folder = os.path.join(app.config['MODEL_FOLDER'], model_id)
+    target = os.path.join(folder, "cv_predictions.json")
+    if not os.path.exists(target):
+        return jsonify({"error": "cv_predictions.json not found"}), 404
+    return send_from_directory(folder, "cv_predictions.json")
+
+
+@app.route("/models/<model_id>/full_predictions", methods=['GET'])
+def get_full_predictions_file(model_id):
+    """Serve the full_predictions.json (all identifiers) for a model."""
+    folder = os.path.join(app.config['MODEL_FOLDER'], model_id)
+    target = os.path.join(folder, "full_predictions.json")
+    if not os.path.exists(target):
+        return jsonify({"error": "full_predictions.json not found"}), 404
+    return send_from_directory(folder, "full_predictions.json")
 
 
 
@@ -568,41 +596,10 @@ def train_model():
         # -------------------------------
         # Aggregate individual predictions
         # -------------------------------
-        if all_fold_predictions:
-            n_experiments = len(all_fold_predictions)
-            n_samples = len(all_fold_predictions[0]['median_predictions'])
-            n_quantiles = len(all_fold_predictions[0]['quantile_levels'])
-
-            # Initialize arrays
-            avg_median_preds = np.zeros(n_samples)
-            avg_mean_preds = np.zeros(n_samples)
-            avg_prob_at_t = np.zeros(n_samples)
-            avg_quan_preds = np.zeros((n_samples, n_quantiles))
-
-            for preds in all_fold_predictions:
-                avg_median_preds += np.array(preds['median_predictions'])
-                avg_mean_preds += np.array(preds['mean_predictions'])
-                avg_prob_at_t += np.array(preds['prob_at_actual_time'])
-                avg_quan_preds += np.array(preds['quantile_predictions'])
-
-            # Compute averages
-            avg_median_preds /= n_experiments
-            avg_mean_preds /= n_experiments
-            avg_prob_at_t /= n_experiments
-            avg_quan_preds /= n_experiments
-
-            aggregated_predictions = {
-                'test_indices': all_fold_predictions[0]['test_indices'],
-                'actual_times': all_fold_predictions[0]['actual_times'],
-                'actual_events': all_fold_predictions[0]['actual_events'],
-                'median_predictions': avg_median_preds.tolist(),
-                'mean_predictions': avg_mean_preds.tolist(),
-                'prob_at_actual_time': avg_prob_at_t.tolist(),
-                'quantile_levels': all_fold_predictions[0]['quantile_levels'],
-                'quantile_predictions': avg_quan_preds.tolist()
-            }
-        else:
-            aggregated_predictions = None
+        aggregated_predictions = aggregate_cv_predictions(all_fold_predictions)
+        full_dataset_predictions = generate_full_dataset_predictions(
+            icp, encoder, dataset_path, selected_features_for_training, args
+        )
 
         # ----------------------------
         # Save artifacts
@@ -643,14 +640,31 @@ def train_model():
         with open(icp_state_path, "wb") as f:
             dill.dump(icp, f)
     
-        # Save CV_predictions
-        cv_predictions_path = os.path.join(model_dir, "cv_predictions.json")
-        with open(cv_predictions_path, 'w') as f:
-            json.dump(aggregated_predictions, f, indent=2)
-            
-        # Also create a summary CSV for easy analysis
-        cv_summary_path = os.path.join(model_dir, "cv_predictions_summary.csv")
-        create_cv_summary_csv(aggregated_predictions, cv_summary_path)
+        if aggregated_predictions:
+            cv_predictions_path = os.path.join(model_dir, "cv_predictions.json")
+            with open(cv_predictions_path, 'w') as f:
+                json.dump(aggregated_predictions, f, indent=2)
+
+            cv_summary_path = os.path.join(model_dir, "cv_predictions_summary.csv")
+            create_cv_summary_csv(aggregated_predictions, cv_summary_path)
+        else:
+            cv_predictions_path = None
+            cv_summary_path = None
+
+        if full_dataset_predictions:
+            full_predictions_path = os.path.join(model_dir, "full_predictions.json")
+            with open(full_predictions_path, 'w') as f:
+                json.dump(full_dataset_predictions, f, indent=2)
+
+            full_summary_path = os.path.join(model_dir, "full_predictions_summary.csv")
+            create_cv_summary_csv(full_dataset_predictions, full_summary_path)
+
+            survival_curve_path = os.path.join(model_dir, "survival_curves.json")
+            save_survival_curve_mapping(full_dataset_predictions, survival_curve_path)
+        else:
+            full_predictions_path = None
+            full_summary_path = None
+            survival_curve_path = None
 
         # Save metrics
         metrics = print_performance(
@@ -674,6 +688,24 @@ def train_model():
         base_url = request.host_url.rstrip("/")  # e.g., http://localhost:5000
        
 
+        cv_info = None
+        if aggregated_predictions:
+            cv_info = {
+                "summary_csv": f"{base_url}/models/{model_id}/cv_predictions_summary.csv" if cv_summary_path else None,
+                "full_predictions": f"{base_url}/models/{model_id}/cv_predictions.json" if cv_predictions_path else None,
+                "n_folds": len(all_fold_predictions),
+                "total_predictions": len(aggregated_predictions['actual_times'])
+            }
+
+        full_info = None
+        if full_dataset_predictions:
+            full_info = {
+                "summary_csv": f"{base_url}/models/{model_id}/full_predictions_summary.csv",
+                "full_predictions": f"{base_url}/models/{model_id}/full_predictions.json",
+                "survival_curves": f"{base_url}/models/{model_id}/survival_curves.json",
+                "total_identifiers": len(full_dataset_predictions['test_indices'])
+            }
+
         response_data = {
             "status": "success",
             "model_id": model_id,
@@ -684,12 +716,8 @@ def train_model():
                 "encoder": f"{base_url}/models/{model_id}/encoder.joblib",
                 "icp_state": f"{base_url}/models/{model_id}/icp_state.dill",
             },
-            "cv_predictions": {
-                "summary_csv": f"{base_url}/models/{model_id}/cv_predictions_summary.csv",
-                "full_predictions": f"{base_url}/models/{model_id}/cv_predictions.json",
-                "n_folds": len(all_fold_predictions),  # total experiments/folds
-                "total_predictions": len(aggregated_predictions['actual_times'])  # total test samples
-            },
+            "cv_predictions": cv_info,
+            "full_dataset_predictions": full_info,
             "trained_at": model_timestamp_date,
             "train_duration": train_duration,
             "timestamp": datetime.now().isoformat()
@@ -908,41 +936,10 @@ def retrain_model():
         # -------------------------------
         # Aggregate individual predictions
         # -------------------------------
-        if all_fold_predictions:
-            n_experiments = len(all_fold_predictions)
-            n_samples = len(all_fold_predictions[0]['median_predictions'])
-            n_quantiles = len(all_fold_predictions[0]['quantile_levels'])
-
-            # Initialize arrays
-            avg_median_preds = np.zeros(n_samples)
-            avg_mean_preds = np.zeros(n_samples)
-            avg_prob_at_t = np.zeros(n_samples)
-            avg_quan_preds = np.zeros((n_samples, n_quantiles))
-
-            for preds in all_fold_predictions:
-                avg_median_preds += np.array(preds['median_predictions'])
-                avg_mean_preds += np.array(preds['mean_predictions'])
-                avg_prob_at_t += np.array(preds['prob_at_actual_time'])
-                avg_quan_preds += np.array(preds['quantile_predictions'])
-
-            # Compute averages
-            avg_median_preds /= n_experiments
-            avg_mean_preds /= n_experiments
-            avg_prob_at_t /= n_experiments
-            avg_quan_preds /= n_experiments
-
-            aggregated_predictions = {
-                'test_indices': all_fold_predictions[0]['test_indices'],
-                'actual_times': all_fold_predictions[0]['actual_times'],
-                'actual_events': all_fold_predictions[0]['actual_events'],
-                'median_predictions': avg_median_preds.tolist(),
-                'mean_predictions': avg_mean_preds.tolist(),
-                'prob_at_actual_time': avg_prob_at_t.tolist(),
-                'quantile_levels': all_fold_predictions[0]['quantile_levels'],
-                'quantile_predictions': avg_quan_preds.tolist()
-            }
-        else:
-            aggregated_predictions = None
+        aggregated_predictions = aggregate_cv_predictions(all_fold_predictions)
+        full_dataset_predictions = generate_full_dataset_predictions(
+            icp, encoder, dataset_path, selected_features_for_training, args
+        )
 
         train_end = time.time()
         train_duration = train_end - train_start
@@ -1003,14 +1000,31 @@ def retrain_model():
         with open(icp_state_path, "wb") as f:
             dill.dump(icp, f)
         
-        # Save CV Predictions
-        cv_predictions_path = os.path.join(model_dir, "cv_predictions.json")
-        with open(cv_predictions_path, 'w') as f:
-            json.dump(aggregated_predictions, f, indent=2)
-            
-        # Also create a summary CSV for easy analysis
-        cv_summary_path = os.path.join(model_dir, "cv_predictions_summary.csv")
-        create_cv_summary_csv(aggregated_predictions, cv_summary_path)
+        if aggregated_predictions:
+            cv_predictions_path = os.path.join(model_dir, "cv_predictions.json")
+            with open(cv_predictions_path, 'w') as f:
+                json.dump(aggregated_predictions, f, indent=2)
+
+            cv_summary_path = os.path.join(model_dir, "cv_predictions_summary.csv")
+            create_cv_summary_csv(aggregated_predictions, cv_summary_path)
+        else:
+            cv_predictions_path = None
+            cv_summary_path = None
+
+        if full_dataset_predictions:
+            full_predictions_path = os.path.join(model_dir, "full_predictions.json")
+            with open(full_predictions_path, 'w') as f:
+                json.dump(full_dataset_predictions, f, indent=2)
+
+            full_summary_path = os.path.join(model_dir, "full_predictions_summary.csv")
+            create_cv_summary_csv(full_dataset_predictions, full_summary_path)
+
+            survival_curve_path = os.path.join(model_dir, "survival_curves.json")
+            save_survival_curve_mapping(full_dataset_predictions, survival_curve_path)
+        else:
+            full_predictions_path = None
+            full_summary_path = None
+            survival_curve_path = None
 
         metrics = print_performance(
             Cindex=ci,
@@ -1031,6 +1045,24 @@ def retrain_model():
 
         base_url = request.host_url.rstrip("/")
 
+        cv_info = None
+        if aggregated_predictions:
+            cv_info = {
+                "summary_csv": f"{base_url}/models/{new_model_id}/cv_predictions_summary.csv",
+                "full_predictions": f"{base_url}/models/{new_model_id}/cv_predictions.json",
+                "n_folds": len(all_fold_predictions),
+                "total_predictions": len(aggregated_predictions['actual_times'])
+            }
+
+        full_info = None
+        if full_dataset_predictions:
+            full_info = {
+                "summary_csv": f"{base_url}/models/{new_model_id}/full_predictions_summary.csv",
+                "full_predictions": f"{base_url}/models/{new_model_id}/full_predictions.json",
+                "survival_curves": f"{base_url}/models/{new_model_id}/survival_curves.json",
+                "total_identifiers": len(full_dataset_predictions['test_indices'])
+            }
+
         response_data = {
             "status": "success",
             "model_id": new_model_id,
@@ -1045,12 +1077,8 @@ def retrain_model():
             "trained_at": model_timestamp_date,
             "train_duration": train_duration,
             "retrained_from": model_id,
-            "cv_predictions": {
-                "summary_csv": f"{base_url}/models/{new_model_id}/cv_predictions_summary.csv",
-                "full_predictions": f"{base_url}/models/{new_model_id}/cv_predictions.json",
-                "n_folds": len(all_fold_predictions),
-                "total_predictions": len(aggregated_predictions['actual_times'])
-            },
+            "cv_predictions": cv_info,
+            "full_dataset_predictions": full_info,
             "retrain_summary": {
                 "features_changed": retrain_history['features_changed'],
                 "parameters_changed": list(retrain_history['parameter_changes'].keys()),
@@ -1394,6 +1422,139 @@ def create_cv_summary_csv(aggregated_predictions, output_path):
     return df
 
 
+def summarize_prediction_stats(quan_levels, quan_preds, actual_times):
+    """Compute median, mean, and event probability for each prediction."""
+    medians = []
+    means = []
+    probs = []
+    median_idx = np.argmin(np.abs(quan_levels - 0.5))
+    survival_curve = 1 - quan_levels
+
+    for row, actual_t in zip(quan_preds, actual_times):
+        medians.append(float(row[median_idx]))
+        means.append(float(np.trapezoid(survival_curve, row)))
+
+        reached = row <= actual_t
+        if np.any(reached):
+            cdf_at_t = np.max(quan_levels[reached])
+            probs.append(float(cdf_at_t * 100))
+        else:
+            probs.append(0.0)
+
+    return medians, means, probs
+
+
+def aggregate_cv_predictions(all_fold_predictions):
+    """Collapse per-fold predictions so each identifier appears once."""
+    if not all_fold_predictions:
+        return None
+
+    quantile_levels = all_fold_predictions[0]['quantile_levels']
+    buckets = defaultdict(lambda: {
+        'actual_times': [],
+        'actual_events': [],
+        'median_predictions': [],
+        'mean_predictions': [],
+        'prob_at_actual_time': [],
+        'quantile_predictions': []
+    })
+
+    for preds in all_fold_predictions:
+        for idx, actual_time, actual_event, median_pred, mean_pred, prob_pred, quantiles in zip(
+            preds['test_indices'],
+            preds['actual_times'],
+            preds['actual_events'],
+            preds['median_predictions'],
+            preds['mean_predictions'],
+            preds['prob_at_actual_time'],
+            preds['quantile_predictions']
+        ):
+            bucket = buckets[idx]
+            bucket['actual_times'].append(actual_time)
+            bucket['actual_events'].append(actual_event)
+            bucket['median_predictions'].append(median_pred)
+            bucket['mean_predictions'].append(mean_pred)
+            bucket['prob_at_actual_time'].append(prob_pred)
+            bucket['quantile_predictions'].append(np.array(quantiles))
+
+    aggregated = {
+        'test_indices': [],
+        'actual_times': [],
+        'actual_events': [],
+        'median_predictions': [],
+        'mean_predictions': [],
+        'prob_at_actual_time': [],
+        'quantile_levels': quantile_levels,
+        'quantile_predictions': []
+    }
+
+    for idx in sorted(buckets.keys()):
+        bucket = buckets[idx]
+        aggregated['test_indices'].append(idx)
+        aggregated['actual_times'].append(float(np.mean(bucket['actual_times'])))
+        aggregated['actual_events'].append(int(round(np.mean(bucket['actual_events']))))
+        aggregated['median_predictions'].append(float(np.mean(bucket['median_predictions'])))
+        aggregated['mean_predictions'].append(float(np.mean(bucket['mean_predictions'])))
+        aggregated['prob_at_actual_time'].append(float(np.mean(bucket['prob_at_actual_time'])))
+        aggregated['quantile_predictions'].append(
+            np.mean(np.vstack(bucket['quantile_predictions']), axis=0).tolist()
+        )
+
+    return aggregated
+
+
+def generate_full_dataset_predictions(icp, encoder, dataset_path, selected_features, args):
+    """Run the trained model on the entire dataset to get predictions for every identifier."""
+    if icp is None or encoder is None:
+        return None
+
+    _, _, _, _, raw_data = prepare_data(dataset_path, selected_features, args)
+    raw_data = raw_data.copy()
+    indices = raw_data.index.tolist()
+
+    encoded = encoder.transform(raw_data).astype('float32')
+    x_full = encoded.drop(['time', 'event'], axis=1).values
+    t_full = encoded['time'].values
+    e_full = encoded['event'].values
+
+    quan_levels, quan_preds = icp.predict(x_full)
+    median_preds, mean_preds, prob_preds = summarize_prediction_stats(quan_levels, quan_preds, t_full)
+
+    return {
+        'test_indices': indices,
+        'actual_times': t_full.tolist(),
+        'actual_events': e_full.tolist(),
+        'median_predictions': median_preds,
+        'mean_predictions': mean_preds,
+        'prob_at_actual_time': prob_preds,
+        'quantile_levels': quan_levels.tolist(),
+        'quantile_predictions': quan_preds.tolist()
+    }
+
+
+def save_survival_curve_mapping(predictions, output_path):
+    """Save a helper JSON for plotting survival probability curves per identifier."""
+    if not predictions:
+        return
+
+    survival_probabilities = [float((1 - q) * 100) for q in predictions['quantile_levels']]
+    curves = {}
+    for idx, curve in zip(predictions['test_indices'], predictions['quantile_predictions']):
+        curves[str(idx)] = {
+            'times': curve,
+            'survival_probabilities': survival_probabilities
+        }
+
+    payload = {
+        'quantile_levels': predictions['quantile_levels'],
+        'survival_probabilities': survival_probabilities,
+        'curves': curves
+    }
+
+    with open(output_path, 'w') as f:
+        json.dump(payload, f, indent=2)
+
+
 
 if __name__ == '__main__':
-    app.run(debug=True, host='localhost', port=5000)
+    app.run(debug=True, host=API_HOST, port=API_PORT)
