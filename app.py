@@ -5,6 +5,7 @@ import dill
 import uuid
 from tqdm import trange
 import time
+import shutil
 from datetime import datetime
 from flask import Flask, request, jsonify, send_file, send_from_directory, url_for
 from werkzeug.utils import secure_filename
@@ -21,6 +22,7 @@ from scipy.stats import chisquare
 import statistics
 from collections import defaultdict
 from flask_cors import CORS
+
 
 from env_loader import load_env_file
 
@@ -134,8 +136,8 @@ def prepare_data(dataset_path, selected_features=None, args=None):
 
     # Standardize column names for survival
     columns = data.columns.tolist()
-    if len(columns) < 2:
-        raise ValueError(f"Dataset must have at least 2 columns. Found {len(columns)} columns.")
+    if len(columns) < 3:
+        raise ValueError(f"Dataset must have at least 3 columns. Found {len(columns)} columns.")
 
     data = data.rename(columns={columns[0]: 'time', columns[1]: 'censored'})
     data['event'] = ((data['censored'] == 0) | (data['censored'] == 'u')).astype(int)
@@ -521,6 +523,8 @@ def train_model():
     dcal_hists.clear()
     n_features = 0
 
+    model_dir = None  
+
 
     try:
         # Handle dataset - either as file upload or JSON path
@@ -548,9 +552,12 @@ def train_model():
         # Parse user-selected configuration
         parameters = json.loads(request.form.get('parameters', '{}'))
 
+        # Load dataset
+        data = pd.read_csv(dataset_path)
+        # selected features
+        selected_features = data.columns[2:].tolist()
 
         # Train on all features by default
-        selected_features = 'all'
         selected_features_for_training = None
 
         config = {'selected_features': selected_features} 
@@ -729,6 +736,12 @@ def train_model():
 
 
     except Exception as e:
+        # ---------------------------------
+        # Cleanup on failure
+        # ---------------------------------
+        if model_dir and os.path.exists(model_dir):
+            shutil.rmtree(model_dir, ignore_errors=True)
+
         return jsonify({
             'status': 'error',
             'error': str(e),
@@ -861,33 +874,26 @@ def retrain_model():
             
        
         # Feature Selection Logic
-        selected_features_input = json_data.get('selected_features', 'inherit')
+        selected_features_input = json_data.get('selected_features', None)
         
-        if selected_features_input == 'inherit':
-            # Not provided - inherit from parent
-            selected_features = original_metadata.get('selected_features')
-            selected_features_for_training = None if selected_features == 'all' else selected_features
-            features_source = 'inherited'
-        elif selected_features_input == 'all':
-            # Explicitly use all features
-            selected_features = 'all'
-            selected_features_for_training = None
-            features_source = 'all'
-        elif isinstance(selected_features_input, list):
+        if isinstance(selected_features_input, list):
             # Specific feature list
             if len(selected_features_input) == 0:
                 return jsonify({'error': 'selected_features list cannot be empty'}), 400
             selected_features = selected_features_input
             selected_features_for_training = selected_features_input
-            features_source = 'selected'
+            if selected_features_input == original_metadata.get('selected_features'):
+                features_source = 'inherited'
+            else:
+                features_source = 'selected'
         elif selected_features_input is None:
             # Explicitly set to None - inherit from parent
             selected_features = original_metadata.get('selected_features')
-            selected_features_for_training = None if selected_features == 'all' else selected_features
+            selected_features_for_training = None
             features_source = 'inherited'
         else:
             return jsonify({
-                'error': 'selected_features must be "all", a list of features, null, or omitted to inherit'
+                'error': 'selected_features must be a list of features, None, or omitted to inherit'
             }), 400
         
         # Get optional parameter overrides
@@ -1099,116 +1105,180 @@ def retrain_model():
 @app.route('/predict', methods=['POST'])
 def predict():
     """
-    Make predictions using a trained model with conformal prediction intervals
-    
-    Expected JSON:
+    Batch prediction endpoint for survival models (MTLR + ICP).
+
+    Expected JSON input:
     {
-        "model_id": "mtlr_20231101_120000_abc123",
-        "features": {
-            "feature1": value1,
-            "feature2": value2,
+        "model_id": "mtlr_20250201_123456_xxx",
+        "features": [
+            {"age": 55, "stage": 3, ... },
+            {"age": 47, "stage": 2, ... },
             ...
-        },
-        "time_points": [0.5, 1, 1.5, 2, 2.5, 3],  # Optional: specific times for survival curve
-        "alpha": 0.1  # Optional: significance level (default 0.1 for 90% prediction interval)
+        ],
+        "time_points": [10, 30, 60, 120],   # Optional (custom requested times)
+        "alpha": 0.1                        # Optional (reserved for future bands)
     }
     """
     try:
         data = request.json
+         # ---------------------------------------------------------
+         # 1. Basic validation
+        # ---------------------------------------------------------
         
         if 'model_id' not in data or 'features' not in data:
             return jsonify({'error': 'Missing model_id or features'}), 400
         
         model_id = data['model_id']
-        model_dir = os.path.join(app.config['MODEL_FOLDER'], model_id)
+        feature_rows = data['features']
         
+        if not isinstance(feature_rows, list) or len(feature_rows) == 0:
+            return jsonify({'error': "'features' must be a non-empty list"}), 400
+        
+        # Load model folder
+        model_dir = os.path.join(app.config['MODEL_FOLDER'], model_id)
         if not os.path.exists(model_dir):
             return jsonify({'error': f'Model {model_id} not found'}), 404
         
-        # Load encoder
+        # ---------------------------------------------------------
+        # 2. Load encoder and ICP wrapper (which contains the MTLR model)
+        # ---------------------------------------------------------
         encoder_path = os.path.join(model_dir, 'encoder.joblib')
         encoder = joblib.load(encoder_path)
         
-        # Load ICP state (contains calibrated conformal scores)
         icp_state_path = os.path.join(model_dir, 'icp_state.dill')
         with open(icp_state_path, 'rb') as f:
             icp = dill.load(f)
         
-        # Prepare input data as DataFrame
-        input_df = pd.DataFrame([data['features']])
+        model = icp.nc_function.model          # Underlying MTLR model
+        time_bins = model.time_bins         # Discrete bins used for S(t)
+       
+        # ----------------------------------------------
+        # 3. Build input DataFrame for ALL samples (batch)
+        # ----------------------------------------------
+
+        input_data = pd.DataFrame(feature_rows)
         
-        # Transform using encoder
-        input_transformed = encoder.transform(input_df)
-        
-        # Extract only feature columns
-        feature_cols = [col for col in input_transformed.columns if col not in ['time', 'event']]
-        x_input = input_transformed[feature_cols].values
-        
-        # Make prediction using ICP (conformal prediction)
-        # This returns calibrated quantile predictions
-        quan_levels, quan_preds = icp.predict(x_input)
-        
-        # quan_levels: array of quantile levels [0.01, 0.02, ..., 0.99]
-        # quan_preds: shape (1, n_quantiles) - time at which each quantile is reached
-        
-        # Get time points for survival curve
-        time_points = data.get('time_points', None)
-        if time_points is None:
-            # Create a grid of time points from 0 to max predicted time
-            max_time = np.max(quan_preds[0])
-            time_points = np.linspace(0, max_time, 100)
+        # Validate features against encoder expectations
+        if hasattr(encoder, 'feature_names_in_'):
+            expected_cols = list(encoder.feature_names_in_)
+
+            # Filter out time/event from expectations as they are target variables
+            required_features = [f for f in expected_cols if f not in ['time', 'event']]
+            
+            # Check for missing features
+            missing_features = [f for f in required_features if f not in input_data.columns]
+            if missing_features:
+                return jsonify({'error': f'Missing features: {missing_features}'}), 400
+                
+            
+            # Add dummy target cols (required by encoder structure)
+            n = len(input_data)
+
+            if "time" in expected_cols and "time" not in input_data.columns:
+                input_data["time"] = [0] * n
+
+            if "event" in expected_cols and "event" not in input_data.columns:
+                input_data["event"] = [0] * n
+                
+            # Reorder to match encoder training
+            input_data = input_data[expected_cols]
+            
         else:
-            time_points = np.array(time_points)
+            # Fallback if feature_names_in_ is missing (unlikely)
+            if 'time' not in input_data.columns:
+                input_data['time'] = 0
+            if 'event' not in input_data.columns:
+                input_data['event'] = 0
         
-        # Convert quantile predictions to survival probabilities
-        # The quantile predictions give us the full survival distribution
-        survival_probs = convert_quantiles_to_survival(
-            quan_levels, quan_preds[0], time_points
+        # -----------------------------
+        # 4. Transform with encoder
+        # -----------------------------
+        input_transformed = encoder.transform(input_data)
+        
+        # Drop time/event after transform (they were only there to satisfy encoder)
+        x_input = input_transformed.drop(['time', 'event'], axis=1).values  
+        n_samples = input_transformed.shape[0]
+
+        # ---------------------------------------------------------
+        # 5. MTLR survival curve for ALL samples
+        # ---------------------------------------------------------
+        # Convert numpy → tensor
+        x_tensor = torch.from_numpy(x_input).float()
+
+        # Move to the correct device (VERY IMPORTANT)
+        device = next(model.parameters()).device
+        x_tensor = x_tensor.to(device)
+        
+        surv_tensor = model.predict_survival(x_tensor)  # (n_samples, n_bins)
+        survival_curves = surv_tensor.cpu().numpy().tolist()
+
+        # ------------------------------------------------------------------
+        # 6. ICP quantile predictions (times at which quantiles are reached)
+        # ------------------------------------------------------------------
+        quan_levels, quan_preds = icp.predict(x_input)   # shapes:
+                                                         # quan_levels: (n_quantiles,)
+                                                         # quan_preds: (n_samples, n_quantiles)
+
+        # ---------------------------------------------------------
+        # 7. Summary statistics per sample
+        # ---------------------------------------------------------
+        medians, means, _ = summarize_prediction_stats(
+            quan_levels, quan_preds, [0] * n_samples
         )
+
+        stats_list = []
+        for i in range(n_samples):
+            q25_idx = int(np.argmin(np.abs(quan_levels - 0.25)))
+            q75_idx = int(np.argmin(np.abs(quan_levels - 0.75)))
+
+            stats_list.append({
+                "median_survival_time": float(medians[i]),
+                "mean_survival_time": float(means[i]),
+                "25th_percentile_time": float(quan_preds[i, q25_idx]),
+                "75th_percentile_time": float(quan_preds[i, q75_idx])
+            })
+
+        # ---------------------------------------------------------
+        # 8. Optional: user-requested custom time points
+        # ---------------------------------------------------------
+        requested_tp = data.get("time_points", None)
+        requested_survival = None
+        if requested_tp is not None:
+            requested_tp = np.array(requested_tp, dtype=float)
+            requested_survival = []
+            for i in range(n_samples):
+                requested_survival.append(
+                    stepwise_survival_at_times(
+                        time_bins,
+                        survival_curves[i],
+                        requested_tp
+                    ).tolist()
+                )
         
-        # Calculate median survival time (50th percentile)
-        median_idx = np.argmin(np.abs(quan_levels - 0.5))
-        median_survival = float(quan_preds[0, median_idx])
-        
-        # Calculate prediction intervals at specific confidence levels
-        # For plotting uncertainty bands like in the image
-        alpha = data.get('alpha', 0.1)  # 90% prediction interval by default
-        
-        # Get lower and upper bounds for survival curve
-        # These come from the quantile predictions at different confidence levels
-        lower_bound_survival = convert_quantiles_to_survival(
-            quan_levels, quan_preds[0], time_points, bound='lower', alpha=alpha
-        )
-        upper_bound_survival = convert_quantiles_to_survival(
-            quan_levels, quan_preds[0], time_points, bound='upper', alpha=alpha
-        )
-        
-        # Format response
-        predictions = {
-            'survival_curve': {
-                'time_points': time_points.tolist(),
-                'survival_probabilities': survival_probs.tolist(),
-                'lower_bound': lower_bound_survival.tolist(),
-                'upper_bound': upper_bound_survival.tolist(),
-                'confidence_level': 1 - alpha
-            },
-            'quantile_predictions': {
-                'quantile_levels': quan_levels.tolist(),
-                'time_points': quan_preds[0].tolist()
-            },
-            'key_statistics': {
-                'median_survival_time': median_survival,
-                '25th_percentile': float(quan_preds[0, np.argmin(np.abs(quan_levels - 0.25))]),
-                '75th_percentile': float(quan_preds[0, np.argmin(np.abs(quan_levels - 0.75))])
+        # -----------------------------
+        # 9. Build response payload
+        # -----------------------------
+        response = {
+            "status": "success",
+            "model_id": model_id,
+            "timestamp": datetime.now().isoformat(),
+            "predictions": {
+                "n_samples": n_samples,
+                "time_points": time_bins.tolist(),
+                "survival_curves": survival_curves,           # list of lists
+                "quantile_levels": quan_levels.tolist(),
+                "quantile_times": quan_preds.tolist(),        # list of lists
+                "statistics": stats_list                      # list of dicts
             }
         }
-        
-        return jsonify({
-            'status': 'success',
-            'predictions': predictions,
-            'model_id': model_id,
-            'timestamp': datetime.now().isoformat()
-        }), 200
+
+        if requested_survival is not None:
+            response["predictions"]["custom_requested"] = {
+                "requested_time_points": requested_tp.tolist(),
+                "requested_survival_curves": requested_survival
+            }
+
+        return jsonify(response), 200
     
     except Exception as e:
         return jsonify({
@@ -1218,47 +1288,6 @@ def predict():
         }), 500
 
 
-def convert_quantiles_to_survival(quantile_levels, quantile_times, time_points, 
-                                   bound='median', alpha=0.1):
-    """
-    Convert quantile predictions to survival probabilities with uncertainty bounds
-    
-    Parameters:
-    -----------
-    quantile_levels : array, shape (n_quantiles,)
-        Quantile levels (e.g., [0.01, 0.02, ..., 0.99])
-    quantile_times : array, shape (n_quantiles,)
-        Time at which each quantile is reached
-    time_points : array, shape (n_timepoints,)
-        Time points at which to evaluate survival
-    bound : str, one of ['lower', 'median', 'upper']
-        Which bound of the prediction interval to return
-    alpha : float
-        Significance level for prediction intervals
-        
-    Returns:
-    --------
-    survival_probs : array, shape (n_timepoints,)
-        Survival probability S(t) at each time point
-    """
-    survival_probs = np.ones(len(time_points))
-    
-    for i, t in enumerate(time_points):
-        # Find the fraction of the distribution that has experienced the event by time t
-        # This is the CDF: F(t) = P(T <= t)
-        reached = quantile_times <= t
-        
-        if np.any(reached):
-            # The CDF at time t is the largest quantile level reached
-            cdf_at_t = np.max(quantile_levels[reached])
-            
-            # Survival function is complement of CDF: S(t) = 1 - F(t)
-            survival_probs[i] = 1.0 - cdf_at_t
-        else:
-            # No events have occurred yet
-            survival_probs[i] = 1.0
-    
-    return survival_probs
 
 
 @app.route('/model/<model_id>', methods=['GET'])
@@ -1387,6 +1416,38 @@ def list_models():
             'error_type': type(e).__name__
         }), 500
 
+def stepwise_survival_at_times(grid_times, surv_probs, query_times):
+    """
+    Stepwise-constant interpolation of survival probabilities.
+
+    grid_times : array-like, shape (n_bins,)
+        Model's time grid (model.time_bins).
+    surv_probs : array-like, shape (n_bins,)
+        Survival probabilities S(t) evaluated on grid_times.
+    query_times : array-like, shape (m,)
+        Arbitrary times at which to evaluate survival.
+
+    Returns
+    -------
+    result : array, shape (m,)
+        Survival probabilities at query_times.
+    """
+    grid_times = np.asarray(grid_times, float)
+    surv_probs = np.asarray(surv_probs, float)
+    query_times = np.asarray(query_times, float)
+
+    result = np.empty_like(query_times, float)
+
+    for i, t in enumerate(query_times):
+        if t <= grid_times[0]:
+            result[i] = 1.0
+        elif t >= grid_times[-1]:
+            result[i] = surv_probs[-1]
+        else:
+            idx = np.searchsorted(grid_times, t, side='right') - 1
+            result[i] = surv_probs[idx]
+
+    return result
 
 def create_cv_summary_csv(aggregated_predictions, output_path):
     """
@@ -1542,7 +1603,7 @@ def save_survival_curve_mapping(predictions, output_path):
     for idx, curve in zip(predictions['test_indices'], predictions['quantile_predictions']):
         curves[str(idx)] = {
             'times': curve,
-            'survival_probabilities': survival_probabilities
+            'survival_probabilities': survival_probabilities 
         }
 
     payload = {
