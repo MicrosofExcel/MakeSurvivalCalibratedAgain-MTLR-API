@@ -59,8 +59,8 @@ CORS_ORIGINS = [
 
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MODEL_FOLDER'] = 'trained_models'
+app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
+app.config['MODEL_FOLDER'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trained_models')
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
 app.config['API_HOST'] = API_HOST
 app.config['API_PORT'] = API_PORT
@@ -91,7 +91,7 @@ class Args:
     """Configuration object for model training"""
     def __init__(self, config):
         # Model parameters
-        self.model = 'MTLR'
+        self.model = config.get('model', 'MTLR')
         self.neurons = config.get('neurons', [64, 64])
         self.norm = config.get('norm', True)
         self.activation = config.get('activation', 'ReLU')
@@ -646,6 +646,10 @@ def train_model():
         icp_state_path = os.path.join(model_dir, "icp_state.dill")
         with open(icp_state_path, "wb") as f:
             dill.dump(icp, f)
+        
+        # Save model dimensions to .mtlr file
+        dimensions_path = os.path.join(model_dir, f"mtlr_model_{model_id}.mtlr")
+        save_dimensions(icp.nc_function.model, dimensions_path)
     
         if aggregated_predictions:
             cv_predictions_path = os.path.join(model_dir, "cv_predictions.json")
@@ -690,6 +694,8 @@ def train_model():
 
         metrics['n_features'] = n_features
         metrics['d_cal_hist'] = torch.stack(dcal_hists).mean(0).tolist()
+        metrics['train_start_time'] = datetime.fromtimestamp(train_start).isoformat()
+        metrics['train_duration'] = train_duration
 
         # Make base_url
         base_url = request.host_url.rstrip("/")  # e.g., http://localhost:5000
@@ -719,10 +725,7 @@ def train_model():
             "metrics": metrics,
             "selected_features": selected_features,
             "model_config": f"{base_url}/models/{model_id}/model_config.json",
-            "model_file": {
-                "encoder": f"{base_url}/models/{model_id}/encoder.joblib",
-                "icp_state": f"{base_url}/models/{model_id}/icp_state.dill",
-            },
+            "mtlr_model": f"{base_url}/models/{model_id}/mtlr_model_{model_id}.mtlr",
             "cv_predictions": cv_info,
             "full_dataset_predictions": full_info,
             "trained_at": model_timestamp_date,
@@ -910,7 +913,7 @@ def retrain_model():
         
         # Override with any other user-provided parameters
         for key, value in parameters.items():
-            if key not in config:
+            if value is not None:
                 config[key] = value
 
         args = Args(config)
@@ -1006,6 +1009,10 @@ def retrain_model():
         with open(icp_state_path, "wb") as f:
             dill.dump(icp, f)
         
+        # Save model dimensions to .mtlr file
+        dimensions_path = os.path.join(model_dir, f"mtlr_model_{new_model_id}.mtlr")
+        save_dimensions(icp.nc_function.model, dimensions_path)
+        
         if aggregated_predictions:
             cv_predictions_path = os.path.join(model_dir, "cv_predictions.json")
             with open(cv_predictions_path, 'w') as f:
@@ -1048,6 +1055,8 @@ def retrain_model():
 
         metrics['n_features'] = n_features
         metrics['d_cal_hist'] = torch.stack(dcal_hists).mean(0).tolist()
+        metrics['train_start_time'] = datetime.fromtimestamp(train_start).isoformat()
+        metrics['train_duration'] = train_duration
 
         base_url = request.host_url.rstrip("/")
 
@@ -1075,11 +1084,8 @@ def retrain_model():
             "parent_model_id": model_id,
             "metrics": metrics,
             "selected_features": selected_features,
-            "model_config": f"{base_url}/models/{model_id}/model_config.json",
-            "model_file": {
-                "encoder": f"{base_url}/models/{model_id}/encoder.joblib",
-                "icp_state": f"{base_url}/models/{model_id}/icp_state.dill",
-            },
+            "model_config": f"{base_url}/models/{new_model_id}/model_config.json",
+            "mtlr_model": f"{base_url}/models/{new_model_id}/mtlr_model_{new_model_id}.mtlr",
             "trained_at": model_timestamp_date,
             "train_duration": train_duration,
             "retrained_from": model_id,
@@ -1130,6 +1136,7 @@ def predict():
         
         model_id = data['model_id']
         feature_rows = data['features']
+        labeled = data.get('labeled', False)
         
         if not isinstance(feature_rows, list) or len(feature_rows) == 0:
             return jsonify({'error': "'features' must be a non-empty list"}), 400
@@ -1195,6 +1202,11 @@ def predict():
         # -----------------------------
         input_transformed = encoder.transform(input_data)
         
+        # IMPORTANT: Cast to float32 to avoid object dtype issues
+        # SimpleImputer and OneHotEncoder can sometimes produce object dtype columns
+        # which cause "can't convert np.ndarray of type numpy.object_" errors
+        input_transformed = input_transformed.astype('float32')
+        
         # Drop time/event after transform (they were only there to satisfy encoder)
         x_input = input_transformed.drop(['time', 'event'], axis=1).values  
         n_samples = input_transformed.shape[0]
@@ -1255,8 +1267,75 @@ def predict():
                     ).tolist()
                 )
         
+        # ---------------------------------------------------------
+        # 9. Handle labeled dataset with full predictions and metrics
+        # ---------------------------------------------------------
+        full_predictions = None
+        metrics = None
+        
+        if labeled:
+            # Load training metadata to get dataset path and selected features
+            metadata_path = os.path.join(model_dir, 'training_metadata.json')
+            if not os.path.exists(metadata_path):
+                return jsonify({'error': 'Training metadata not found for labeled prediction'}), 404
+            
+            with open(metadata_path, 'r') as f:
+                training_metadata = json.load(f)
+            
+            dataset_path = training_metadata.get('dataset_path')
+            if not dataset_path or not os.path.exists(dataset_path):
+                return jsonify({'error': f'Dataset path not found or does not exist: {dataset_path}'}), 404
+            
+            selected_features = training_metadata.get('selected_features')
+            
+            # Load Args from model config
+            config_path = os.path.join(model_dir, 'model_config.json')
+            with open(config_path, 'r') as f:
+                model_config = json.load(f)
+            
+            # Create Args object with model config
+            args_config = {
+                'neurons': model_config.get('neurons'),
+                'dropout': model_config.get('dropout'),
+                'activation': model_config.get('activation'),
+                'norm': model_config.get('norm'),
+            }
+            args = Args(args_config)
+            
+            # Generate full dataset predictions
+            full_predictions = generate_full_dataset_predictions(
+                icp, encoder, dataset_path, selected_features, args
+            )
+            
+            # Calculate concordance index and integrated brier score
+            if full_predictions:
+                t_full = np.array(full_predictions['actual_times'])
+                e_full = np.array(full_predictions['actual_events'])
+                quan_preds_full = np.array(full_predictions['quantile_predictions'])
+                quan_levels_full = np.array(full_predictions['quantile_levels'])
+                
+                # Create evaluator
+                evaler = QuantileRegEvaluator(
+                    quan_preds_full, quan_levels_full, t_full, e_full,
+                    t_full, e_full,  # Using same data for train_val as we're evaluating on full dataset
+                    predict_time_method="Median", interpolation=args.interpolate
+                )
+                
+                # Calculate core metrics
+                c_index = float(evaler.concordance(ties="All")[0])
+                ibs_score = float(evaler.integrated_brier_score(num_points=10))
+                km_cal_score = float(evaler.km_calibration())
+                _ , dcal_hist = evaler.d_calibration()
+                
+                metrics = {
+                    'concordance_index': c_index,
+                    'integrated_brier_score': ibs_score,
+                    'km_calibration': km_cal_score,
+                    'd_calibration': dcal_hist.tolist()
+                }
+        
         # -----------------------------
-        # 9. Build response payload
+        # 10. Build response payload
         # -----------------------------
         response = {
             "status": "success",
@@ -1277,6 +1356,12 @@ def predict():
                 "requested_time_points": requested_tp.tolist(),
                 "requested_survival_curves": requested_survival
             }
+        
+        # Add full predictions and metrics if labeled=True
+        if labeled and full_predictions:
+            response["full_predictions"] = full_predictions
+            if metrics:
+                response["metrics"] = metrics
 
         return jsonify(response), 200
     
@@ -1614,6 +1699,45 @@ def save_survival_curve_mapping(predictions, output_path):
 
     with open(output_path, 'w') as f:
         json.dump(payload, f, indent=2)
+
+
+def save_dimensions(model, filepath: str):
+    """Save all model dimensions + parameter dump into a text file."""
+    with open(filepath, "w") as f:
+
+        # Header
+        f.write("------ MTLR MODEL DIMENSIONS ------\n")
+
+        # Number of features
+        f.write(f"n_features: {model.in_features}\n")
+
+        # Time bins
+        f.write(f"m (n_time_bins): {model.output_size}\n")
+        f.write("time_bins:\n")
+        time_bins_list = model.time_bins.cpu().numpy().tolist()
+        f.write(",".join(str(x) for x in time_bins_list) + "\n")
+
+        # Hidden layers
+        if model.hidden_size:
+            f.write(f"r (n_hidden_layers): {len(model.hidden_size)}\n")
+            f.write(f"hidden_sizes: {model.hidden_size}\n")
+        else:
+            f.write("r (n_hidden_layers): 0\n")
+
+        # Total parameters
+        total_params = sum(p.numel() for p in model.parameters())
+        f.write(f"DIM (total parameters): {total_params}\n\n")
+
+        # Flatten parameters
+        flat = torch.cat([
+            p.detach().cpu().flatten() for p in model.parameters()
+        ])
+
+        # Parameter dump (one per line)
+        f.write("PARAMETERS:\n")
+        for i, val in enumerate(flat):
+            f.write(f"{i+1}:{val.item()}\n")
+
 
 
 

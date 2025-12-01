@@ -295,8 +295,7 @@ class CoxPH(SurvivalBase):
             n_data = len(risks)
             risk_score = torch.exp(risks)
             risk_score = risk_score.squeeze()
-            survival_curves = torch.empty((n_data, self.baseline_survival.shape[0]), dtype=torch.double).to(
-                risks.device)
+            survival_curves = torch.empty((n_data, self.baseline_survival.shape[0]), dtype=torch.double).to(risks.device)
             for i in range(n_data):
                 survival_curve = torch.pow(self.baseline_survival, risk_score[i])
                 survival_curves[i] = survival_curve
